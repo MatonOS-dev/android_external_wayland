@@ -9,14 +9,14 @@ third_party {
     type: GIT
     value: "https://gitlab.freedesktop.org/wayland/wayland.git"
   }
-  version: "1.22.0"
+  version: "1.26.0"
   license_type: NOTICE
   security {
-    tag: "NVD-CPE2.3:cpe:/a:wayland:wayland:1.22.0"
+    tag: "NVD-CPE2.3:cpe:/a:wayland:wayland:1.26.0"
   }
   last_upgrade_date {
-    year: 2023
-    month: 8
-    day: 8
+    year: 2026
+    month: 9
+    day: 28
   }
 }
