@@ -25,6 +25,7 @@
  * SOFTWARE.
  */
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include "wayland-util.h"
@@ -44,6 +45,8 @@ extern const struct wl_interface intf_not_here_interface;
 
 static const struct wl_interface *small_test_types[] = {
 	NULL,
+	NULL,
+	NULL,
 	&intf_not_here_interface,
 	NULL,
 	NULL,
@@ -55,17 +58,18 @@ static const struct wl_interface *small_test_types[] = {
 
 static const struct wl_message intf_A_requests[] = {
 	{ "rq1", "sun", small_test_types + 0 },
-	{ "rq2", "nsiufho", small_test_types + 1 },
+	{ "rq2", "nsiufho", small_test_types + 3 },
 	{ "destroy", "", small_test_types + 0 },
 };
 
 static const struct wl_message intf_A_events[] = {
 	{ "hey", "", small_test_types + 0 },
+	{ "yo", "2", small_test_types + 0 },
 };
 
 WL_PRIVATE const struct wl_interface intf_A_interface = {
 	"intf_A", 3,
 	3, intf_A_requests,
-	1, intf_A_events,
+	2, intf_A_events,
 };
 

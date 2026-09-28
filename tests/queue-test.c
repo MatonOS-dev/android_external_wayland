@@ -40,6 +40,7 @@
 #include "wayland-server.h"
 #include "test-runner.h"
 #include "test-compositor.h"
+#include "../src/timespec-util.h"
 
 #define ARRAY_LENGTH(a) (sizeof (a) / sizeof (a)[0])
 
@@ -383,7 +384,7 @@ client_test_queue_destroy_with_attached_proxies(void)
 	/* Check that the log contains some information about the attached
 	 * wl_callback proxy. */
 	log = map_file(client_log_fd, &log_len);
-	ret = snprintf(callback_name, sizeof(callback_name), "wl_callback@%u",
+	ret = snprintf(callback_name, sizeof(callback_name), "wl_callback#%u",
 		       wl_proxy_get_id((struct wl_proxy *) callback));
 	assert(ret > 0 && ret < (int)sizeof(callback_name) &&
 	       "callback name creation failed (possibly truncated)");
@@ -456,7 +457,7 @@ client_test_queue_destroy_default_with_attached_proxies(void)
 	/* Check that the log does not contain any warning about the attached
 	 * wl_callback proxy. */
 	log = maybe_map_file(client_log_fd, &log_len);
-	ret = snprintf(callback_name, sizeof(callback_name), "wl_callback@%u",
+	ret = snprintf(callback_name, sizeof(callback_name), "wl_callback#%u",
 		       wl_proxy_get_id((struct wl_proxy *) callback));
 	assert(ret > 0 && ret < (int)sizeof(callback_name) &&
 	       "callback name creation failed (possibly truncated)");
@@ -469,6 +470,211 @@ client_test_queue_destroy_default_with_attached_proxies(void)
 	 * destroyed the associated wl_display, using this function would lead
 	 * to memory errors. */
 	free(callback);
+}
+
+static void
+check_queue_name(struct wl_proxy *proxy, const char *name)
+{
+	struct wl_event_queue *queue;
+	const char *queue_name;
+
+	queue = wl_proxy_get_queue(proxy);
+	queue_name = wl_event_queue_get_name(queue);
+	if (!name)
+		assert(!queue_name);
+	else
+		assert(strcmp(queue_name, name) == 0);
+}
+
+static struct wl_callback *
+roundtrip_named_queue_nonblock(struct wl_display *display,
+			       struct wl_event_queue *queue,
+			       const char *name)
+{
+	struct wl_callback *callback;
+	struct wl_display *wrapped_display = NULL;
+
+	if (queue) {
+		wrapped_display = wl_proxy_create_wrapper(display);
+		assert(wrapped_display);
+		wl_proxy_set_queue((struct wl_proxy *) wrapped_display, queue);
+		check_queue_name((struct wl_proxy *) wrapped_display, name);
+
+		callback = wl_display_sync(wrapped_display);
+	} else
+		callback = wl_display_sync(display);
+
+	check_queue_name((struct wl_proxy *) callback, name);
+
+	if (wrapped_display)
+		wl_proxy_wrapper_destroy(wrapped_display);
+
+	assert(callback != NULL);
+
+	return callback;
+}
+
+static void
+client_test_queue_names(void)
+{
+	struct wl_event_queue *queue1, *queue2, *queue3;
+	struct wl_display *display;
+	struct wl_callback *callback1, *callback2, *callback3, *callback4;
+	struct wl_event_queue *default_queue;
+	char *log;
+	size_t log_len;
+	const char *default_queue_name;
+
+	display = wl_display_connect(NULL);
+	assert(display);
+
+	default_queue = wl_proxy_get_queue((struct wl_proxy *) display);
+	default_queue_name = wl_event_queue_get_name(default_queue);
+	assert(strcmp(default_queue_name, "Default Queue") == 0);
+
+	/* Create some event queues both with and without names. */
+	queue1 = wl_display_create_queue_with_name(display, "First");
+	assert(queue1);
+
+	queue2 = wl_display_create_queue_with_name(display, "Second");
+	assert(queue2);
+
+	queue3 = wl_display_create_queue(display);
+	assert(queue3);
+
+	/* Create some requests and ensure their queues have the expected
+	 * names.
+	 */
+	callback1 = roundtrip_named_queue_nonblock(display, queue1, "First");
+	callback2 = roundtrip_named_queue_nonblock(display, queue2, "Second");
+	callback3 = roundtrip_named_queue_nonblock(display, queue3, NULL);
+	callback4 = roundtrip_named_queue_nonblock(display, NULL, "Default Queue");
+
+	/* Destroy one queue with proxies still attached so we can verify
+         * that the queue name is in the log message. */
+	wl_event_queue_destroy(queue2);
+	log = map_file(client_log_fd, &log_len);
+	assert(strstr(log, "Second"));
+
+	/* There's no reason for the First queue name to be present. */
+	assert(!strstr(log, "First"));
+
+	munmap(log, log_len);
+
+	wl_callback_destroy(callback1);
+	wl_callback_destroy(callback2);
+	wl_callback_destroy(callback3);
+	wl_callback_destroy(callback4);
+
+	wl_event_queue_destroy(queue1);
+	wl_event_queue_destroy(queue3);
+
+	wl_display_disconnect(display);
+}
+
+static void
+dispatch_timeout_sync_callback(void *data, struct wl_callback *callback,
+			       uint32_t serial)
+{
+	bool *done = data;
+
+	*done = true;
+	wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener dispatch_timeout_sync_listener = {
+	dispatch_timeout_sync_callback
+};
+
+static void
+client_test_queue_dispatch_simple(void)
+{
+	struct wl_display *display;
+	struct timespec timeout;
+	struct wl_callback *callback;
+	bool done = false;
+	int ret = 0;
+
+	display = wl_display_connect(NULL);
+	assert(display);
+
+	callback = wl_display_sync(display);
+	assert(callback != NULL);
+	wl_callback_add_listener(callback, &dispatch_timeout_sync_listener, &done);
+
+	timespec_from_msec(&timeout, 1000);
+
+	while (!done) {
+		ret = wl_display_dispatch_timeout(display, &timeout);
+		assert(ret > 0);
+	}
+
+	wl_display_disconnect(display);
+
+	exit(0);
+}
+
+static void
+client_test_queue_dispatch_timeout(void)
+{
+	struct wl_display *display;
+	struct timespec timeout;
+	int ret = 0;
+
+	display = wl_display_connect(NULL);
+	assert(display);
+
+	timespec_from_msec(&timeout, 100);
+
+	ret = wl_display_dispatch_timeout(display, &timeout);
+	assert(ret == 0);
+
+	wl_display_disconnect(display);
+
+	exit(0);
+}
+
+/* Try to use a proxy with a destroyed queue as a factory for
+ * another proxy (either normal or wrapper). This should succeed
+ * although the new proxy may not be useful until a queue is attached.
+ * The following code is safe to perform in the context of the test, since
+ * we are not flushing the display write buffer, neither explicitly
+ * (wl_display_flush()) nor implicitly (we don't place enough data to
+ * fill the display buffer and cause an auto-flush). */
+static void
+client_test_queue_destroy_then_use_proxy_as_factory(void)
+{
+	struct wl_display *display;
+	struct wl_event_queue *queue;
+	struct wl_registry *registry, *registry_wrapper;
+	struct wl_proxy *proxy;
+
+	display = wl_display_connect(NULL);
+	assert(display);
+
+	/* Create registry with a queue that's immediately destroyed. */
+	queue = wl_display_create_queue(display);
+	assert(queue);
+	registry = wl_display_get_registry(display);
+	assert(registry);
+	wl_proxy_set_queue((struct wl_proxy *) registry, queue);
+	wl_event_queue_destroy(queue);
+
+	/* Scenario 1: Create a proxy using the registry (never flushed,
+	 * so details don't matter). */
+	proxy = wl_registry_bind(registry, 1000, &wl_output_interface, 1);
+	assert(proxy);
+
+	/* Scenario 2: Create a wrapper proxy using the registry. */
+	registry_wrapper = wl_proxy_create_wrapper(registry);
+	assert(registry_wrapper);
+
+	wl_proxy_wrapper_destroy((struct wl_proxy *) registry_wrapper);
+	wl_proxy_destroy(proxy);
+	wl_registry_destroy(registry);
+	wl_display_disconnect(display);
+
+	exit(0);
 }
 
 static void
@@ -593,6 +799,54 @@ TEST(queue_destroy_default_with_attached_proxies)
 	test_set_timeout(2);
 
 	client_create_noarg(d, client_test_queue_destroy_default_with_attached_proxies);
+	display_run(d);
+
+	display_destroy(d);
+}
+
+TEST(queue_names)
+{
+	struct display *d = display_create();
+
+	test_set_timeout(2);
+
+	client_create_noarg(d, client_test_queue_names);
+	display_run(d);
+
+	display_destroy(d);
+}
+
+TEST(queue_dispatch_simple)
+{
+	struct display *d = display_create();
+
+	test_set_timeout(2);
+
+	client_create_noarg(d, client_test_queue_dispatch_simple);
+	display_run(d);
+
+	display_destroy(d);
+}
+
+TEST(queue_dispatch_timeout)
+{
+	struct display *d = display_create();
+
+	test_set_timeout(2);
+
+	client_create_noarg(d, client_test_queue_dispatch_timeout);
+	display_run(d);
+
+	display_destroy(d);
+}
+
+TEST(queue_destroy_then_use_proxy_as_factory)
+{
+	struct display *d = display_create();
+
+	test_set_timeout(2);
+
+	client_create_noarg(d, client_test_queue_destroy_then_use_proxy_as_factory);
 	display_run(d);
 
 	display_destroy(d);

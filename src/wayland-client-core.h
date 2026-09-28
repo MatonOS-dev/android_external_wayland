@@ -34,6 +34,8 @@
 extern "C" {
 #endif
 
+struct timespec;
+
 /** \class wl_proxy
  *
  * \brief Represents a protocol object on the client side.
@@ -120,7 +122,7 @@ struct wl_display;
 struct wl_event_queue;
 
 /** Destroy proxy after marshalling
- * @ingroup wl_proxy
+ * \relates wl_proxy
  */
 #define WL_MARSHAL_FLAG_DESTROY (1 << 0)
 
@@ -219,11 +221,23 @@ wl_proxy_get_tag(struct wl_proxy *proxy);
 const char *
 wl_proxy_get_class(struct wl_proxy *proxy);
 
+const struct wl_interface *
+wl_proxy_get_interface(struct wl_proxy *proxy);
+
+struct wl_display *
+wl_proxy_get_display(struct wl_proxy *proxy);
+
 void
 wl_proxy_set_queue(struct wl_proxy *proxy, struct wl_event_queue *queue);
 
 struct wl_proxy *
 wl_proxy_from_object(struct wl_object *object);
+
+struct wl_event_queue *
+wl_proxy_get_queue(const struct wl_proxy *proxy);
+
+const char *
+wl_event_queue_get_name(const struct wl_event_queue *queue);
 
 struct wl_display *
 wl_display_connect(const char *name);
@@ -245,11 +259,27 @@ wl_display_dispatch_queue(struct wl_display *display,
 			  struct wl_event_queue *queue);
 
 int
+wl_display_dispatch_timeout(struct wl_display *display,
+			    const struct timespec *timeout);
+
+int
+wl_display_dispatch_queue_timeout(struct wl_display *display,
+				  struct wl_event_queue *queue,
+				  const struct timespec *timeout);
+
+int
 wl_display_dispatch_queue_pending(struct wl_display *display,
 				  struct wl_event_queue *queue);
 
 int
+wl_display_dispatch_queue_pending_single(struct wl_display *display,
+					 struct wl_event_queue *queue);
+
+int
 wl_display_dispatch_pending(struct wl_display *display);
+
+int
+wl_display_dispatch_pending_single(struct wl_display *display);
 
 int
 wl_display_get_error(struct wl_display *display);
@@ -272,6 +302,10 @@ wl_display_roundtrip(struct wl_display *display);
 struct wl_event_queue *
 wl_display_create_queue(struct wl_display *display);
 
+struct wl_event_queue *
+wl_display_create_queue_with_name(struct wl_display *display,
+				  const char *name);
+
 int
 wl_display_prepare_read_queue(struct wl_display *display,
 			      struct wl_event_queue *queue);
@@ -288,97 +322,34 @@ wl_display_read_events(struct wl_display *display);
 void
 wl_log_set_handler_client(wl_log_func_t handler);
 
-/**
- * The message type.
- */
+/** Message direction reported to a client message observer. */
 enum wl_client_message_type {
-	/** The message is a request */
 	WL_CLIENT_MESSAGE_REQUEST,
-
-	/** The message is an event */
 	WL_CLIENT_MESSAGE_EVENT,
 };
 
-/**
- * The message discard reason codes.
- */
+/** Why an incoming event was not dispatched. */
 enum wl_client_message_discarded_reason {
-	/** The message was handled normally, and not discarded. */
 	WL_CLIENT_MESSAGE_NOT_DISCARDED = 0,
-
-	/** The target was not alive at dispatch time */
 	WL_CLIENT_MESSAGE_DISCARD_DEAD_PROXY_ON_DISPATCH,
-
-	/** The target had no listener or dispatcher */
 	WL_CLIENT_MESSAGE_DISCARD_NO_LISTENER_ON_DISPATCH,
-
-	/** The target was not valid when the event was demarshalled */
 	WL_CLIENT_MESSAGE_DISCARD_UNKNOWN_ID_ON_DEMARSHAL,
 };
 
-/**
- * The structure used to communicate details about an observed message to the
- * registered observers.
- */
 struct wl_client_observed_message {
-	/** The target for the message */
 	struct wl_proxy *proxy;
-
-	/** The message opcode */
 	int message_opcode;
-
-	/** The protocol message structure */
 	const struct wl_message *message;
-
-	/** The count of arguments to the message */
 	int arguments_count;
-
-	/** The argument array for the messagge */
 	const union wl_argument *arguments;
-
-	/** The discard reason code */
 	enum wl_client_message_discarded_reason discarded_reason;
-
-	/**
-	 * The discard reason string, or NULL if the event was not discarded.
-	 *
-	 * This string is only for convenience for a observer that does
-	 * logging. The string values should not be considered stable, and
-	 * are not localized.
-	 */
 	const char *discarded_reason_str;
 };
 
-/**
- * The signature for a client message observer function, as registered with
- * wl_display_add_client_observer().
- *
- * \param user_data \c user_data pointer given when the observer was
- *                  registered with \c wl_display_create_client_observer
- * \param type      type of message
- * \param message   details for the message
- */
 typedef void (*wl_client_message_observer_func_t)(
 	void *user_data, enum wl_client_message_type type,
 	const struct wl_client_observed_message *message);
 
-/** \class wl_client_observer
- *
- * \brief Represents a client message observer
- *
- * A client observer allows the client to observe all request and event
- * message traffic to and from the client. For events, the observer is
- * also given a discard reason if the event wasn't handled.
- *
- * The typical use for the observer is to allow the client implementation to
- * do its own debug logging, as the default when setting WAYLAND_DEBUG is to
- * log to stderr.
- *
- * With this runtime call, the client can also enable and disable the observer
- * at any time.
- *
- * The protocol-logger-test.c file has an example of a logger implementation.
- */
 struct wl_client_observer;
 
 struct wl_client_observer *
@@ -388,6 +359,10 @@ wl_display_create_client_observer(struct wl_display *display,
 
 void
 wl_client_observer_destroy(struct wl_client_observer *observer);
+
+void
+wl_display_set_max_buffer_size(struct wl_display *display,
+                               size_t max_buffer_size);
 
 #ifdef  __cplusplus
 }

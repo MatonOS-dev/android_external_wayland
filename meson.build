@@ -1,14 +1,18 @@
 project(
 	'wayland', 'c',
-	version: '1.22.0',
+	version: '1.26.0',
 	license: 'MIT',
-	meson_version: '>= 0.56.0',
+	meson_version: '>= 0.64.0',
 	default_options: [
 		'warning_level=2',
 		'buildtype=debugoptimized',
 		'c_std=c99',
 	]
 )
+
+fs = import('fs')
+pkgconfig = import('pkgconfig')
+
 wayland_version = meson.project_version().split('.')
 
 config_h = configuration_data()
@@ -16,7 +20,7 @@ config_h.set_quoted('PACKAGE', meson.project_name())
 config_h.set_quoted('PACKAGE_VERSION', meson.project_version())
 
 cc_args = []
-if host_machine.system() != 'freebsd'
+if host_machine.system() not in ['freebsd', 'openbsd']
 	cc_args += ['-D_POSIX_C_SOURCE=200809L']
 endif
 add_project_arguments(cc_args, language: 'c')
@@ -46,6 +50,7 @@ have_funcs = [
 	'memfd_create',
 	'mremap',
 	'strndup',
+	'gettid',
 ]
 foreach f: have_funcs
 	config_h.set('HAVE_' + f.underscorify().to_upper(), cc.has_function(f))
@@ -69,7 +74,7 @@ endif
 config_h.set10('HAVE_BROKEN_MSG_CMSG_CLOEXEC', have_broken_msg_cmsg_cloexec)
 
 if get_option('libraries')
-	if host_machine.system() == 'freebsd'
+	if host_machine.system() in ['freebsd', 'openbsd']
 		# When building for FreeBSD, epoll(7) is provided by a userspace
 		# wrapper around kqueue(2).
 		epoll_dep = dependency('epoll-shim')
@@ -105,8 +110,6 @@ configure_file(
 	configuration: config_h,
 )
 
-pkgconfig = import('pkgconfig')
-
 wayland_protocol_xml = files('protocol/wayland.xml')
 
 root_inc = include_directories('.')
@@ -131,7 +134,9 @@ if get_option('scanner')
 		'wayland-scanner.mk',
 		'protocol/wayland.xml',
 		'protocol/wayland.dtd',
-	])
+	],
+		install_dir: join_paths(get_option('prefix'), get_option('datadir'), 'wayland'),
+	)
 
 	install_data(
 		[ 'wayland-scanner.m4' ],

@@ -92,8 +92,8 @@ get_socket_name(void)
 	static char retval[64];
 
 	gettimeofday(&tv, NULL);
-	snprintf(retval, sizeof retval, "wayland-test-%d-%ld%ld",
-		 getpid(), tv.tv_sec, tv.tv_usec);
+	snprintf(retval, sizeof retval, "wayland-test-%d-%lld%lld",
+		 (int) getpid(), (long long int) tv.tv_sec, (long long int) tv.tv_usec);
 
 	return retval;
 }
@@ -103,26 +103,23 @@ handle_client_destroy(void *data)
 {
 	struct client_info *ci = data;
 	struct display *d;
-	siginfo_t status;
+	int status;
 
 	d = ci->display;
 
-	assert(waitid(P_PID, ci->pid, &status, WEXITED) != -1);
+	assert(waitpid(ci->pid, &status, 0) != -1);
 
-	switch (status.si_code) {
-	case CLD_KILLED:
-	case CLD_DUMPED:
+	if (WIFSIGNALED(status)) {
 		fprintf(stderr, "Client '%s' was killed by signal %d\n",
-			ci->name, status.si_status);
-		ci->kill_code = status.si_status;
-		break;
-	case CLD_EXITED:
-		if (status.si_status != EXIT_SUCCESS)
-			fprintf(stderr, "Client '%s' exited with code %d\n",
-				ci->name, status.si_status);
+			ci->name, WTERMSIG(status));
+		ci->kill_code = WTERMSIG(status);
 
-		ci->exit_code = status.si_status;
-		break;
+	} else if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != EXIT_SUCCESS)
+			fprintf(stderr, "Client '%s' exited with code %d\n",
+				ci->name, WEXITSTATUS(status));
+
+		ci->exit_code = WEXITSTATUS(status);
 	}
 
 	++d->clients_terminated_no;
@@ -494,14 +491,15 @@ registry_handle_globals(void *data, struct wl_registry *registry,
 {
 	struct client *c = data;
 
-	if (strcmp(intf, "test") != 0)
-		return;
+	if (strcmp(intf, "test") == 0) {
+		c->tc = wl_registry_bind(registry, id, &test_compositor_interface, ver);
+		assert(c->tc && "Failed binding to registry");
 
-	c->tc = wl_registry_bind(registry, id, &test_compositor_interface, ver);
-	assert(c->tc && "Failed binding to registry");
-
-	wl_proxy_add_listener((struct wl_proxy *) c->tc,
-			      (void *) &tc_listener, c);
+		wl_proxy_add_listener((struct wl_proxy *) c->tc,
+				      (void *) &tc_listener, c);
+	} else if (strcmp(intf, wl_fixes_interface.name) == 0) {
+		c->wl_fixes = wl_registry_bind(registry, id, &wl_fixes_interface, 2);
+	}
 }
 
 static const struct wl_registry_listener registry_listener =
@@ -510,7 +508,7 @@ static const struct wl_registry_listener registry_listener =
 	NULL
 };
 
-struct client *client_connect()
+struct client *client_connect(void)
 {
 	struct wl_registry *reg;
 	struct client *c = calloc(1, sizeof *c);
@@ -520,13 +518,16 @@ struct client *client_connect()
 	assert(c->wl_display && "Failed connecting to display");
 
 	/* create test_compositor proxy. Do it with temporary
-	 * registry so that client can define it's own listener later */
+	 * registry so that client can define its own listener later */
 	reg = wl_display_get_registry(c->wl_display);
 	assert(reg);
 	wl_registry_add_listener(reg, &registry_listener, c);
 	wl_display_roundtrip(c->wl_display);
 	assert(c->tc);
 
+	if (c->wl_fixes) {
+		wl_fixes_destroy_registry(c->wl_fixes, reg);
+	}
 	wl_registry_destroy(reg);
 
 	return c;
@@ -558,6 +559,10 @@ client_disconnect(struct client *c)
 {
 	/* check for errors */
 	check_error(c->wl_display);
+
+	if (c->wl_fixes) {
+		wl_fixes_destroy(c->wl_fixes);
+	}
 
 	wl_proxy_destroy((struct wl_proxy *) c->tc);
 	wl_display_disconnect(c->wl_display);

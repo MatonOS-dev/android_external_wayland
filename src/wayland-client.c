@@ -37,7 +37,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <ctype.h>
-#include <assert.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -46,6 +45,7 @@
 #include "wayland-os.h"
 #include "wayland-client.h"
 #include "wayland-private.h"
+#include "timespec-util.h"
 
 /** \cond */
 
@@ -77,6 +77,7 @@ struct wl_event_queue {
 	struct wl_list event_list;
 	struct wl_list proxy_list; /**< struct wl_proxy::queue_link */
 	struct wl_display *display;
+	char *name;
 };
 
 struct wl_display {
@@ -109,11 +110,13 @@ struct wl_display {
 	int reader_count;
 	uint32_t read_serial;
 	pthread_cond_t reader_cond;
-
 	struct wl_list observers;
 };
 
 /** \endcond */
+
+static int debug_client = 0;
+static int debug_color = 0;
 
 struct wl_client_observer {
 	struct wl_list link;
@@ -122,56 +125,29 @@ struct wl_client_observer {
 	void *user_data;
 };
 
-static int debug_client = 0;
-
-/**
- * This helper function adjusts the closure arguments before they are logged.
- * On the client, after the call to create_proxies(), NEW_ID arguments will
- * point to a wl_proxy accessible via arg.o instead of being an int32
- * accessible by arg.n, which is what wl_closure_print() attempts to print.
- * This helper transforms the argument back into an id, so wl_closure_print()
- * doesn't need to handle that as a special case.
- *
- * \param closure  closure to adjust
- * \param send     if this is closure is for a request
- *
- */
 static void
-adjust_closure_args_for_logging(struct wl_closure *closure, bool send)
+adjust_closure_args_for_observer(struct wl_closure *closure, bool send)
 {
 	int i;
 	struct argument_details arg;
-	const struct wl_proxy *proxy;
 	const char *signature = closure->message->signature;
 
-	// No adjustment needed for a send.
 	if (send)
 		return;
 
 	for (i = 0; i < closure->count; i++) {
 		signature = get_next_argument(signature, &arg);
-
-		switch (arg.type) {
-		case 'n':
-			proxy = (struct wl_proxy *)closure->args[i].o;
+		if (arg.type == WL_ARG_NEW_ID) {
+			struct wl_proxy *proxy = (struct wl_proxy *)closure->args[i].o;
 			closure->args[i].n = proxy ? proxy->object.id : 0;
-			break;
 		}
 	}
 }
 
-/**
- * Maps the \c discard_reason to a string suitable for logging.
- *
- * \param discarded_reason  reason for discard
- * \return A string describing the reason, or NULL.
- *
- */
 static const char *
-get_discarded_reason_str(
-	enum wl_client_message_discarded_reason discarded_reason)
+get_discarded_reason_str(enum wl_client_message_discarded_reason reason)
 {
-	switch (discarded_reason) {
+	switch (reason) {
 	case WL_CLIENT_MESSAGE_NOT_DISCARDED:
 		return NULL;
 	case WL_CLIENT_MESSAGE_DISCARD_DEAD_PROXY_ON_DISPATCH:
@@ -184,105 +160,60 @@ get_discarded_reason_str(
 	return NULL;
 }
 
-/**
- * This function helps log closures from the client, assuming logging is
- * enabled.
- *
- * \param closure    closure for the message
- * \param proxy      proxy for the message
- * \param send       true if this is closure is for a request
- * \param discarded_reason  reason if the message is being discarded, or
- *                          WL_CLIENT_MESSAGE_NOT_DISCARDED
- */
 static void
 closure_log(struct wl_closure *closure, struct wl_proxy *proxy, bool send,
-	    enum wl_client_message_discarded_reason discarded_reason)
+	    enum wl_client_message_discarded_reason reason)
 {
 	struct wl_display *display = proxy->display;
-	const char *discarded_reason_str;
-	struct wl_closure adjusted_closure = { 0 };
+	struct wl_closure adjusted = { 0 };
+	struct wl_client_observer *observer;
+	struct wl_client_observed_message message;
 
-	if (!debug_client && wl_list_empty(&display->observers))
+	if (wl_list_empty(&display->observers))
 		return;
 
-	// Note: The real closure has extra data (referenced by its args
-	// immediately following the structure in memory, but we don't
-	// need to duplicate that.
-	memcpy(&adjusted_closure, closure, sizeof(struct wl_closure));
-
-	// Adjust the closure arguments.
-	adjust_closure_args_for_logging(&adjusted_closure, send);
-
-	discarded_reason_str = get_discarded_reason_str(discarded_reason);
-
-	if (debug_client)
-		wl_closure_print(&adjusted_closure, &proxy->object, send,
-				 discarded_reason_str);
-
-	if (!wl_list_empty(&display->observers)) {
-		enum wl_client_message_type type =
-			send ? WL_CLIENT_MESSAGE_REQUEST
-			     : WL_CLIENT_MESSAGE_EVENT;
-		struct wl_client_observer *observer;
-		struct wl_client_observed_message message;
-
-		message.proxy = proxy;
-		message.message_opcode = adjusted_closure.opcode;
-		message.message = adjusted_closure.message;
-		message.arguments_count = adjusted_closure.count;
-		message.arguments = adjusted_closure.args;
-		message.discarded_reason = discarded_reason;
-		message.discarded_reason_str = discarded_reason_str;
-		wl_list_for_each(observer, &display->observers, link) {
-			observer->func(observer->user_data, type, &message);
-		}
-	}
+	memcpy(&adjusted, closure, sizeof adjusted);
+	adjust_closure_args_for_observer(&adjusted, send);
+	message.proxy = proxy;
+	message.message_opcode = adjusted.opcode;
+	message.message = adjusted.message;
+	message.arguments_count = adjusted.count;
+	message.arguments = adjusted.args;
+	message.discarded_reason = reason;
+	message.discarded_reason_str = get_discarded_reason_str(reason);
+	wl_list_for_each(observer, &display->observers, link)
+		observer->func(observer->user_data,
+			       send ? WL_CLIENT_MESSAGE_REQUEST : WL_CLIENT_MESSAGE_EVENT,
+			       &message);
 }
 
-/**
- * This function helps log unknown messages on the client, when logging is
- * enabled.
- *
- * \param display    current display
- * \param zombie     true if there was a zombie for the message target
- * \param id         id of the proxy this message was meant for
- * \param opcode     opcode from the message
- * \param num_fds    number of fd arguments for this message
- * \param num_bytes  byte size of this message
- */
 static void
 log_unknown_message(struct wl_display *display, bool zombie, uint32_t id,
 		    int opcode, int num_fds, int num_bytes)
 {
 	char event_detail[100];
-	struct wl_interface unknown_interface = { 0 };
-	struct wl_proxy unknown_proxy = { 0 };
-	struct wl_message unknown_message = { 0 };
-	struct wl_closure unknown_closure = { 0 };
+	struct wl_interface interface = { 0 };
+	struct wl_proxy proxy = { 0 };
+	struct wl_message message = { 0 };
+	struct wl_closure closure = { 0 };
 
-	if (!debug_client && wl_list_empty(&display->observers))
+	if (wl_list_empty(&display->observers))
 		return;
-
 	snprintf(event_detail, sizeof event_detail,
 		 "[event %d, %d fds, %d bytes]", opcode, num_fds, num_bytes);
-
-	unknown_interface.name = zombie ? "[zombie]" : "[unknown]";
-
-	unknown_proxy.object.interface = &unknown_interface;
-	unknown_proxy.object.id = id;
-	unknown_proxy.display = display;
-	unknown_proxy.refcount = -1;
-	unknown_proxy.flags = WL_PROXY_FLAG_WRAPPER;
-
-	unknown_message.name = event_detail;
-	unknown_message.signature = "";
-	unknown_message.types = NULL;
-
-	unknown_closure.message = &unknown_message;
-	unknown_closure.opcode = opcode;
-	unknown_closure.proxy = &unknown_proxy;
-
-	closure_log(&unknown_closure, &unknown_proxy, false,
+	interface.name = zombie ? "[zombie]" : "[unknown]";
+	proxy.object.interface = &interface;
+	proxy.object.id = id;
+	proxy.display = display;
+	proxy.refcount = -1;
+	proxy.flags = WL_PROXY_FLAG_WRAPPER;
+	message.name = event_detail;
+	message.signature = "";
+	message.types = NULL;
+	closure.message = &message;
+	closure.opcode = opcode;
+	closure.proxy = &proxy;
+	closure_log(&closure, &proxy, false,
 		    WL_CLIENT_MESSAGE_DISCARD_UNKNOWN_ID_ON_DEMARSHAL);
 }
 
@@ -391,23 +322,30 @@ display_protocol_error(struct wl_display *display, uint32_t code,
 }
 
 static void
-wl_event_queue_init(struct wl_event_queue *queue, struct wl_display *display)
+wl_event_queue_init(struct wl_event_queue *queue,
+		    struct wl_display *display,
+		    const char *name)
 {
 	wl_list_init(&queue->event_list);
 	wl_list_init(&queue->proxy_list);
 	queue->display = display;
+	if (name)
+		queue->name = strdup(name);
 }
 
 static void
 wl_proxy_unref(struct wl_proxy *proxy)
 {
-	assert(proxy->refcount > 0);
+	if (!(proxy->refcount > 0))
+		wl_abort("Proxy requested for unref has no references\n");
 	if (--proxy->refcount > 0)
 		return;
 
 	/* If we get here, the client must have explicitly requested
 	 * deletion. */
-	assert(proxy->flags & WL_PROXY_FLAG_DESTROYED);
+	if (!(proxy->flags & WL_PROXY_FLAG_DESTROYED))
+		wl_abort("Proxy with no references not yet explicitly"
+			 "destroyed\n");
 	free(proxy);
 }
 
@@ -424,8 +362,8 @@ validate_closure_objects(struct wl_closure *closure)
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
 		switch (arg.type) {
-		case 'n':
-		case 'o':
+		case WL_ARG_NEW_ID:
+		case WL_ARG_OBJECT:
 			proxy = (struct wl_proxy *) closure->args[i].o;
 			if (proxy && proxy->flags & WL_PROXY_FLAG_DESTROYED)
 				closure->args[i].o = NULL;
@@ -452,8 +390,8 @@ destroy_queued_closure(struct wl_closure *closure)
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
 		switch (arg.type) {
-		case 'n':
-		case 'o':
+		case WL_ARG_NEW_ID:
+		case WL_ARG_OBJECT:
 			proxy = (struct wl_proxy *) closure->args[i].o;
 			if (proxy)
 				wl_proxy_unref(proxy);
@@ -476,14 +414,21 @@ wl_event_queue_release(struct wl_event_queue *queue)
 		struct wl_proxy *proxy, *tmp;
 
 		if (queue != &queue->display->default_queue) {
-			wl_log("warning: queue %p destroyed while proxies "
-			       "still attached:\n", queue);
+			if (queue->name) {
+				wl_log("warning: queue \"%s\" "
+				       "%p destroyed while proxies "
+				       "still attached:\n", queue->name, queue);
+			} else {
+				wl_log("warning: queue "
+				       "%p destroyed while proxies "
+				       "still attached:\n", queue);
+			}
 		}
 
 		wl_list_for_each_safe(proxy, tmp, &queue->proxy_list,
 				      queue_link) {
 			if (queue != &queue->display->default_queue) {
-				wl_log("  %s@%u still attached\n",
+				wl_log("  %s#%u still attached\n",
 				       proxy->object.interface->name,
 				       proxy->object.id);
 			}
@@ -521,6 +466,7 @@ wl_event_queue_destroy(struct wl_event_queue *queue)
 
 	pthread_mutex_lock(&display->mutex);
 	wl_event_queue_release(queue);
+	free(queue->name);
 	free(queue);
 	pthread_mutex_unlock(&display->mutex);
 }
@@ -542,7 +488,30 @@ wl_display_create_queue(struct wl_display *display)
 	if (queue == NULL)
 		return NULL;
 
-	wl_event_queue_init(queue, display);
+	wl_event_queue_init(queue, display, NULL);
+
+	return queue;
+}
+
+/** Create a new event queue for this display and give it a name
+ *
+ * \param display The display context object
+ * \param name A human readable queue name
+ * \return A new event queue associated with this display or NULL on
+ * failure.
+ *
+ * \memberof wl_display
+ */
+WL_EXPORT struct wl_event_queue *
+wl_display_create_queue_with_name(struct wl_display *display, const char *name)
+{
+	struct wl_event_queue *queue;
+
+	queue = zalloc(sizeof *queue);
+	if (queue == NULL)
+		return NULL;
+
+	wl_event_queue_init(queue, display, name);
 
 	return queue;
 }
@@ -556,7 +525,7 @@ message_count_fds(const char *signature)
 	count = arg_count_for_signature(signature);
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
-		if (arg.type == 'h')
+		if (arg.type == WL_ARG_FD)
 			fds++;
 	}
 
@@ -630,7 +599,10 @@ proxy_create(struct wl_proxy *factory, const struct wl_interface *interface,
 		return NULL;
 	}
 
-	wl_list_insert(&proxy->queue->proxy_list, &proxy->queue_link);
+	if (proxy->queue != NULL)
+		wl_list_insert(&proxy->queue->proxy_list, &proxy->queue_link);
+	else
+		wl_list_init(&proxy->queue_link);
 
 	return proxy;
 }
@@ -691,7 +663,10 @@ wl_proxy_create_for_id(struct wl_proxy *factory,
 		return NULL;
 	}
 
-	wl_list_insert(&proxy->queue->proxy_list, &proxy->queue_link);
+	if (proxy->queue != NULL)
+		wl_list_insert(&proxy->queue->proxy_list, &proxy->queue_link);
+	else
+		wl_list_init(&proxy->queue_link);
 
 	return proxy;
 }
@@ -806,6 +781,9 @@ wl_proxy_add_listener(struct wl_proxy *proxy,
  * This function is useful in clients with multiple listeners on the same
  * interface to allow the identification of which code to execute.
  *
+ * If \ref wl_proxy_add_dispatcher was used, this function returns the
+ * dispatcher_data pointer instead.
+ *
  * \memberof wl_proxy
  */
 WL_EXPORT const void *
@@ -868,16 +846,14 @@ create_outgoing_proxy(struct wl_proxy *proxy, const struct wl_message *message,
 	count = arg_count_for_signature(signature);
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
+		if (arg.type != WL_ARG_NEW_ID)
+			continue;
 
-		switch (arg.type) {
-		case 'n':
-			new_proxy = proxy_create(proxy, interface, version);
-			if (new_proxy == NULL)
-				return NULL;
+		new_proxy = proxy_create(proxy, interface, version);
+		if (new_proxy == NULL)
+			return NULL;
 
-			args[i].o = &new_proxy->object;
-			break;
-		}
+		args[i].o = &new_proxy->object;
 	}
 
 	return new_proxy;
@@ -1051,15 +1027,31 @@ wl_proxy_marshal_array_flags(struct wl_proxy *proxy, uint32_t opcode,
 
 	closure = wl_closure_marshal(&proxy->object, opcode, args, message);
 	if (closure == NULL) {
-		wl_log("Error marshalling request: %s\n", strerror(errno));
+		wl_log("Error marshalling request for %s.%s: %s\n",
+		       proxy->object.interface->name, message->name,
+		       strerror(errno));
 		display_fatal_error(proxy->display, errno);
 		goto err_unlock;
 	}
 
 	closure_log(closure, proxy, true, WL_CLIENT_MESSAGE_NOT_DISCARDED);
 
+	if (debug_client) {
+		struct wl_event_queue *queue;
+		const char *queue_name = NULL;
+
+		queue = wl_proxy_get_queue(proxy);
+		if (queue)
+			queue_name = wl_event_queue_get_name(queue);
+
+		wl_closure_print(closure, &proxy->object, true, false, NULL,
+				 queue_name, debug_color);
+	}
+
 	if (wl_closure_send(closure, proxy->display->connection)) {
-		wl_log("Error sending request: %s\n", strerror(errno));
+		wl_log("Error sending request for %s.%s: %s\n",
+		       proxy->object.interface->name, message->name,
+		       strerror(errno));
 		display_fatal_error(proxy->display, errno);
 	}
 
@@ -1215,7 +1207,7 @@ display_handle_error(void *data,
 	const struct wl_interface *interface;
 
 	if (proxy) {
-		wl_log("%s@%u: error %d: %s\n",
+		wl_log("%s#%u: error %d: %s\n",
 		       proxy->object.interface->name,
 		       proxy->object.id,
 		       code, message);
@@ -1303,7 +1295,8 @@ connect_to_socket(const char *name)
 			         "%s", name) + 1;
 	}
 
-	assert(name_size > 0);
+	if (!(name_size > 0))
+		wl_abort("Error assigning path name for socket connection\n");
 	if (name_size > (int)sizeof addr.sun_path) {
 		if (!path_is_absolute) {
 			wl_log("error: socket path \"%s/%s\" plus null terminator"
@@ -1345,10 +1338,23 @@ wl_display_connect_to_fd(int fd)
 {
 	struct wl_display *display;
 	const char *debug;
+	const char *no_color;
+	const char *force_color;
 
+	no_color = getenv("NO_COLOR");
+	force_color = getenv("FORCE_COLOR");
 	debug = getenv("WAYLAND_DEBUG");
-	if (debug && (strstr(debug, "client") || strstr(debug, "1")))
+	if (debug && (wl_check_env_token(debug, "client") || wl_check_env_token(debug, "1"))) {
 		debug_client = 1;
+		if (isatty(fileno(stderr)))
+			debug_color = 1;
+	}
+
+	if (force_color && force_color[0] != '\0')
+		debug_color = 1;
+
+	if (no_color && no_color[0] != '\0')
+		debug_color = 0;
 
 	display = zalloc(sizeof *display);
 	if (display == NULL) {
@@ -1358,8 +1364,8 @@ wl_display_connect_to_fd(int fd)
 
 	display->fd = fd;
 	wl_map_init(&display->objects, WL_MAP_CLIENT_SIDE);
-	wl_event_queue_init(&display->default_queue, display);
-	wl_event_queue_init(&display->display_queue, display);
+	wl_event_queue_init(&display->default_queue, display, "Default Queue");
+	wl_event_queue_init(&display->display_queue, display, "Display Queue");
 	pthread_mutex_init(&display->mutex, NULL);
 	pthread_cond_init(&display->reader_cond, NULL);
 	display->reader_count = 0;
@@ -1401,7 +1407,7 @@ wl_display_connect_to_fd(int fd)
 	 */
 	display->proxy.version = 0;
 
-	display->connection = wl_connection_create(display->fd);
+	display->connection = wl_connection_create(display->fd, 0);
 	if (display->connection == NULL)
 		goto err_connection;
 
@@ -1492,7 +1498,9 @@ wl_display_disconnect(struct wl_display *display)
 	wl_map_for_each(&display->objects, free_zombies, NULL);
 	wl_map_release(&display->objects);
 	wl_event_queue_release(&display->default_queue);
+	free(display->default_queue.name);
 	wl_event_queue_release(&display->display_queue);
+	free(display->display_queue.name);
 	wl_list_remove(&display->observers);
 	pthread_mutex_destroy(&display->mutex);
 	pthread_cond_destroy(&display->reader_cond);
@@ -1618,22 +1626,19 @@ create_proxies(struct wl_proxy *sender, struct wl_closure *closure)
 	count = arg_count_for_signature(signature);
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
-		switch (arg.type) {
-		case 'n':
-			id = closure->args[i].n;
-			if (id == 0) {
-				closure->args[i].o = NULL;
-				break;
-			}
-			proxy = wl_proxy_create_for_id(sender, id,
-						       closure->message->types[i]);
-			if (proxy == NULL)
-				return -1;
-			closure->args[i].o = (struct wl_object *)proxy;
-			break;
-		default:
-			break;
+		if (arg.type != WL_ARG_NEW_ID)
+			continue;
+
+		id = closure->args[i].n;
+		if (id == 0) {
+			closure->args[i].o = NULL;
+			continue;
 		}
+		proxy = wl_proxy_create_for_id(sender, id,
+					       closure->message->types[i]);
+		if (proxy == NULL)
+			return -1;
+		closure->args[i].o = (struct wl_object *)proxy;
 	}
 
 	return 0;
@@ -1652,8 +1657,8 @@ increase_closure_args_refcount(struct wl_closure *closure)
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
 		switch (arg.type) {
-		case 'n':
-		case 'o':
+		case WL_ARG_NEW_ID:
+		case WL_ARG_OBJECT:
 			proxy = (struct wl_proxy *) closure->args[i].o;
 			if (proxy)
 				proxy->refcount++;
@@ -1675,12 +1680,35 @@ queue_event(struct wl_display *display, int len)
 	struct wl_closure *closure;
 	const struct wl_message *message;
 	struct wl_event_queue *queue;
+	struct timespec tp;
 	int num_zombie_fds;
 
 	wl_connection_copy(display->connection, p, sizeof p);
 	id = p[0];
 	opcode = p[1] & 0xffff;
 	size = p[1] >> 16;
+
+	/*
+	 * If the message is larger than the maximum size of the
+	 * connection buffer, the connection buffer will fill to
+	 * its max size and stay there, with no message ever
+	 * successfully being processed.  If the user of
+	 * libwayland-client uses a level-triggered event loop,
+	 * this will cause the client to enter a loop that
+	 * consumes CPU.  To avoid this, immediately drop the
+	 * connection.  Since the maximum size of a message should
+	 * not depend on the max buffer size chosen by the client,
+	 * always compare the message size against the
+	 * limit enforced by libwayland 1.22 and below (4096),
+	 * rather than the actual value the client chose.
+	 */
+	if (size > WL_MAX_MESSAGE_SIZE) {
+		wl_log("Message length %u exceeds limit %d\n",
+		       size, WL_MAX_MESSAGE_SIZE);
+		errno = E2BIG;
+		return -1;
+	}
+
 	if (len < size)
 		return 0;
 
@@ -1695,6 +1723,23 @@ queue_event(struct wl_display *display, int len)
 		log_unknown_message(display, !!zombie, id, opcode,
 				    num_zombie_fds, size);
 
+		if (debug_client) {
+			clock_gettime(CLOCK_REALTIME, &tp);
+			fprintf(stderr, "%s[%02u:%02u:%02u.%06u] %sdiscarded %s[%s]%s#%u%s.[event %d]%s"
+				"(%d fd, %d byte)\n",
+				debug_color ? WL_DEBUG_COLOR_GREEN : "",
+				(unsigned) ((tp.tv_sec / 3600) % 24),
+				(unsigned) ((tp.tv_sec / 60) % 60),
+				(unsigned) (tp.tv_sec % 60),
+				(unsigned) (tp.tv_nsec / 1000),
+				debug_color ? WL_DEBUG_COLOR_RED : "",
+				debug_color ? WL_DEBUG_COLOR_BLUE : "",
+				zombie ? "zombie" : "unknown",
+				debug_color ? WL_DEBUG_COLOR_MAGENTA : "", id,
+				debug_color ? WL_DEBUG_COLOR_BLUE : "", opcode,
+				debug_color ? WL_DEBUG_COLOR_RESET : "",
+				num_zombie_fds, size);
+		}
 		if (num_zombie_fds > 0)
 			wl_connection_close_fds_in(display->connection,
 						   num_zombie_fds);
@@ -1741,6 +1786,19 @@ queue_event(struct wl_display *display, int len)
 	return size;
 }
 
+static uint32_t
+id_from_object(union wl_argument *arg)
+{
+	struct wl_proxy *proxy;
+
+	if (arg->o) {
+		proxy = (struct wl_proxy *)arg->o;
+		return proxy->object.id;
+	}
+
+	return 0;
+}
+
 static void
 dispatch_event(struct wl_display *display, struct wl_event_queue *queue)
 {
@@ -1758,29 +1816,42 @@ dispatch_event(struct wl_display *display, struct wl_event_queue *queue)
 	validate_closure_objects(closure);
 	proxy = closure->proxy;
 	proxy_destroyed = !!(proxy->flags & WL_PROXY_FLAG_DESTROYED);
+
 	if (proxy_destroyed) {
 		closure_log(closure, proxy, false,
 			    WL_CLIENT_MESSAGE_DISCARD_DEAD_PROXY_ON_DISPATCH);
-	} else if (proxy->dispatcher) {
-		closure_log(closure, proxy, false,
-			    WL_CLIENT_MESSAGE_NOT_DISCARDED);
-
-		pthread_mutex_unlock(&display->mutex);
-		wl_closure_dispatch(closure, proxy->dispatcher,
-				    &proxy->object, opcode);
-		pthread_mutex_lock(&display->mutex);
-	} else if (proxy->object.implementation) {
-		closure_log(closure, proxy, false,
-			    WL_CLIENT_MESSAGE_NOT_DISCARDED);
-
-		pthread_mutex_unlock(&display->mutex);
-		wl_closure_invoke(closure, WL_CLOSURE_INVOKE_CLIENT,
-				  &proxy->object, opcode, proxy->user_data);
-		pthread_mutex_lock(&display->mutex);
-	} else {
+	} else if (!proxy->dispatcher && !proxy->object.implementation) {
 		closure_log(closure, proxy, false,
 			    WL_CLIENT_MESSAGE_DISCARD_NO_LISTENER_ON_DISPATCH);
+	} else {
+		closure_log(closure, proxy, false,
+			    WL_CLIENT_MESSAGE_NOT_DISCARDED);
 	}
+
+	if (debug_client) {
+		bool discarded = proxy_destroyed ||
+				 !(proxy->dispatcher || proxy->object.implementation);
+
+		wl_closure_print(closure, &proxy->object, false, discarded,
+				 id_from_object, queue->name, debug_color);
+	}
+
+	if (proxy_destroyed) {
+		destroy_queued_closure(closure);
+		return;
+	}
+
+	pthread_mutex_unlock(&display->mutex);
+
+	if (proxy->dispatcher) {
+		wl_closure_dispatch(closure, proxy->dispatcher,
+				    &proxy->object, opcode);
+	} else if (proxy->object.implementation) {
+		wl_closure_invoke(closure, WL_CLOSURE_INVOKE_CLIENT,
+				  &proxy->object, opcode, proxy->user_data);
+	}
+
+	pthread_mutex_lock(&display->mutex);
 
 	destroy_queued_closure(closure);
 }
@@ -1936,6 +2007,34 @@ err:
 	return -1;
 }
 
+
+static int
+dispatch_queue_single(struct wl_display *display, struct wl_event_queue *queue)
+{
+	if (display->last_error)
+		goto err;
+
+	while (!wl_list_empty(&display->display_queue.event_list)) {
+		dispatch_event(display, &display->display_queue);
+		if (display->last_error)
+			goto err;
+	}
+
+	if (!wl_list_empty(&queue->event_list)) {
+		dispatch_event(display, queue);
+		if (display->last_error)
+			goto err;
+		return 1;
+	} else {
+		return 0;
+	}
+
+err:
+	errno = display->last_error;
+
+	return -1;
+}
+
 /** Prepare to read events from the display's file descriptor to a queue
  *
  * \param display The display context object
@@ -2051,18 +2150,140 @@ wl_display_cancel_read(struct wl_display *display)
 }
 
 static int
-wl_display_poll(struct wl_display *display, short int events)
+wl_display_poll(struct wl_display *display,
+		short int events,
+		const struct timespec *timeout)
 {
 	int ret;
 	struct pollfd pfd[1];
+	struct timespec now;
+	struct timespec deadline = {0};
+	struct timespec result;
+	struct timespec *remaining_timeout = NULL;
+
+	if (timeout) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		timespec_add(&deadline, &now, timeout);
+	}
 
 	pfd[0].fd = display->fd;
 	pfd[0].events = events;
 	do {
-		ret = poll(pfd, 1, -1);
+		if (timeout) {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			timespec_sub_saturate(&result, &deadline, &now);
+			remaining_timeout = &result;
+		}
+		ret = ppoll(pfd, 1, remaining_timeout, NULL);
 	} while (ret == -1 && errno == EINTR);
 
 	return ret;
+}
+
+/** Dispatch events in an event queue with a timeout
+ *
+ * \param display The display context object
+ * \param queue The event queue to dispatch
+ * \param timeout A timeout describing how long the call should block trying to
+ * dispatch events
+ * \return The number of dispatched events on success, -1 on failure
+ *
+ * This function behaves identical to wl_display_dispatch_queue() except
+ * that it also takes a timeout and returns 0 if the timeout elapsed.
+ *
+ * Passing NULL as a timeout means an infinite timeout. An empty timespec
+ * causes wl_display_dispatch_queue_timeout() to return immediately even if no
+ * events have been dispatched.
+ *
+ * If a timeout is passed to wl_display_dispatch_queue_timeout() it is updated
+ * to the remaining time.
+ *
+ * \sa wl_display_dispatch_queue()
+ *
+ * \memberof wl_display
+ */
+WL_EXPORT int
+wl_display_dispatch_queue_timeout(struct wl_display *display,
+				  struct wl_event_queue *queue,
+				  const struct timespec *timeout)
+{
+	int ret;
+	struct timespec now;
+	struct timespec deadline = {0};
+	struct timespec result;
+	struct timespec *remaining_timeout = NULL;
+
+	if (timeout) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		timespec_add(&deadline, &now, timeout);
+	}
+
+	if (wl_display_prepare_read_queue(display, queue) == -1)
+		return wl_display_dispatch_queue_pending(display, queue);
+
+	while (true) {
+		ret = wl_display_flush(display);
+
+		if (ret != -1 || errno != EAGAIN)
+			break;
+
+		if (timeout) {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			timespec_sub_saturate(&result, &deadline, &now);
+			remaining_timeout = &result;
+		}
+		ret = wl_display_poll(display, POLLOUT, remaining_timeout);
+
+		if (ret <= 0) {
+			wl_display_cancel_read(display);
+			return ret;
+		}
+	}
+
+	/* Don't stop if flushing hits an EPIPE; continue so we can read any
+	 * protocol error that may have triggered it. */
+	if (ret < 0 && errno != EPIPE) {
+		wl_display_cancel_read(display);
+		return -1;
+	}
+
+	while (true) {
+		if (timeout) {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			timespec_sub_saturate(&result, &deadline, &now);
+			remaining_timeout = &result;
+		}
+
+		ret = wl_display_poll(display, POLLIN, remaining_timeout);
+		if (ret <= 0) {
+			wl_display_cancel_read(display);
+			break;
+		}
+
+		ret = wl_display_read_events(display);
+		if (ret == -1)
+			break;
+
+		ret = wl_display_dispatch_queue_pending(display, queue);
+		if (ret != 0)
+			break;
+
+		/* We managed to read data from the display but there is no
+		 * complete event to dispatch yet. Try reading again. */
+		if (wl_display_prepare_read_queue(display, queue) == -1)
+			return wl_display_dispatch_queue_pending(display, queue);
+	}
+
+	return ret;
+}
+
+WL_EXPORT int
+wl_display_dispatch_timeout(struct wl_display *display,
+			    const struct timespec *timeout)
+{
+	return wl_display_dispatch_queue_timeout(display,
+						 &display->default_queue,
+						 timeout);
 }
 
 /** Dispatch events in an event queue
@@ -2096,8 +2317,8 @@ wl_display_poll(struct wl_display *display, short int events)
  * \note Since Wayland 1.5 the display has an extra queue
  * for its own events (i. e. delete_id). This queue is dispatched always,
  * no matter what queue we passed as an argument to this function.
- * That means that this function can return non-0 value even when it
- * haven't dispatched any event for the given queue.
+ * That means that this function can return even when it has not dispatched any
+ * event for the given queue.
  *
  * \sa wl_display_dispatch(), wl_display_dispatch_pending(),
  * wl_display_dispatch_queue_pending(), wl_display_prepare_read_queue()
@@ -2110,37 +2331,10 @@ wl_display_dispatch_queue(struct wl_display *display,
 {
 	int ret;
 
-	if (wl_display_prepare_read_queue(display, queue) == -1)
-		return wl_display_dispatch_queue_pending(display, queue);
+	ret = wl_display_dispatch_queue_timeout(display, queue, NULL);
+	assert(ret == -1 || ret > 0);
 
-	while (true) {
-		ret = wl_display_flush(display);
-
-		if (ret != -1 || errno != EAGAIN)
-			break;
-
-		if (wl_display_poll(display, POLLOUT) == -1) {
-			wl_display_cancel_read(display);
-			return -1;
-		}
-	}
-
-	/* Don't stop if flushing hits an EPIPE; continue so we can read any
-	 * protocol error that may have triggered it. */
-	if (ret < 0 && errno != EPIPE) {
-		wl_display_cancel_read(display);
-		return -1;
-	}
-
-	if (wl_display_poll(display, POLLIN) == -1) {
-		wl_display_cancel_read(display);
-		return -1;
-	}
-
-	if (wl_display_read_events(display) == -1)
-		return -1;
-
-	return wl_display_dispatch_queue_pending(display, queue);
+	return ret;
 }
 
 /** Dispatch pending events in an event queue
@@ -2165,6 +2359,34 @@ wl_display_dispatch_queue_pending(struct wl_display *display,
 	pthread_mutex_lock(&display->mutex);
 
 	ret = dispatch_queue(display, queue);
+
+	pthread_mutex_unlock(&display->mutex);
+
+	return ret;
+}
+
+/** Dispatch at most one pending event in an event queue
+ *
+ * \param display The display context object
+ * \param queue The event queue to dispatch
+ * \return The number of dispatched events (0 or 1) on success or -1 on failure
+ *
+ * Dispatch at most one pending event for objects assigned to the given
+ * event queue. On failure -1 is returned and errno set appropriately.
+ * If there are no events queued, this function returns immediately.
+ *
+ * \memberof wl_display
+ * \since 1.25.0
+ */
+WL_EXPORT int
+wl_display_dispatch_queue_pending_single(struct wl_display *display,
+					 struct wl_event_queue *queue)
+{
+	int ret;
+
+	pthread_mutex_lock(&display->mutex);
+
+	ret = dispatch_queue_single(display, queue);
 
 	pthread_mutex_unlock(&display->mutex);
 
@@ -2229,6 +2451,25 @@ wl_display_dispatch_pending(struct wl_display *display)
 {
 	return wl_display_dispatch_queue_pending(display,
 						 &display->default_queue);
+}
+
+/** Dispatch at most one pending event in the default event queue.
+ *
+ * \param display The display context object
+ * \return The number of dispatched events (0 or 1) on success or -1 on failure
+ *
+ * Dispatch at most one pending event for objects assigned to the default
+ * event queue. On failure -1 is returned and errno set appropriately.
+ * If there are no events queued, this function returns immediately.
+ *
+ * \memberof wl_display
+ * \since 1.25.0
+ */
+WL_EXPORT int
+wl_display_dispatch_pending_single(struct wl_display *display)
+{
+	return wl_display_dispatch_queue_pending_single(display,
+			                             &display->default_queue);
 }
 
 /** Retrieve the last error that occurred on a display
@@ -2343,6 +2584,32 @@ wl_display_flush(struct wl_display *display)
 	pthread_mutex_unlock(&display->mutex);
 
 	return ret;
+}
+
+/** Adjust the maximum size of the client connection buffers
+ *
+ * \param display The display context object
+ * \param max_buffer_size The maximum size of the connection buffers
+ *
+ * Client buffers are unbounded by default. This function sets a limit to the
+ * size of the connection buffers.
+ *
+ * A value of 0 for \a max_buffer_size requests the buffers to be unbounded.
+ *
+ * The actual size of the connection buffers is a power of two, the requested
+ * \a max_buffer_size is therefore rounded up to the nearest power of two value.
+ *
+ * Lowering the maximum size may not take effect immediately if the current
+ * content of the buffer does not fit within the new size limit.
+ *
+ * \memberof wl_display
+ * \since 1.22.90
+ */
+WL_EXPORT void
+wl_display_set_max_buffer_size(struct wl_display *display,
+                               size_t max_buffer_size)
+{
+	wl_connection_set_max_buffer_size(display->connection, max_buffer_size);
 }
 
 /** Set the user data associated with a proxy
@@ -2486,6 +2753,34 @@ wl_proxy_get_class(struct wl_proxy *proxy)
 	return proxy->object.interface->name;
 }
 
+/** Get the interface of a proxy object
+ *
+ * \param proxy The proxy object
+ * \return The interface of the object associated with the proxy
+ *
+ * \memberof wl_proxy
+ * \since 1.24
+ */
+WL_EXPORT const struct wl_interface *
+wl_proxy_get_interface(struct wl_proxy *proxy)
+{
+	return proxy->object.interface;
+}
+
+/** Get the display of a proxy object
+ *
+ * \param proxy The proxy object
+ * \return The wl_display the proxy is associated with
+ *
+ * \memberof wl_proxy
+ * \since 1.23
+ */
+WL_EXPORT struct wl_display *
+wl_proxy_get_display(struct wl_proxy *proxy)
+{
+	return proxy->display;
+}
+
 /** Assign a proxy to an event queue
  *
  * \param proxy The proxy object
@@ -2522,7 +2817,9 @@ wl_proxy_set_queue(struct wl_proxy *proxy, struct wl_event_queue *queue)
 	wl_list_remove(&proxy->queue_link);
 
 	if (queue) {
-		assert(proxy->display == queue->display);
+		if (!(proxy->display == queue->display))
+			wl_abort("Proxy and queue point to different "
+				 "wl_displays");
 		proxy->queue = queue;
 	} else {
 		proxy->queue = &proxy->display->default_queue;
@@ -2531,6 +2828,34 @@ wl_proxy_set_queue(struct wl_proxy *proxy, struct wl_event_queue *queue)
 	wl_list_insert(&proxy->queue->proxy_list, &proxy->queue_link);
 
 	pthread_mutex_unlock(&proxy->display->mutex);
+}
+
+/** Get a proxy's event queue
+ *
+ * \param proxy The proxy to query
+ *
+ * Return the event queue
+ */
+WL_EXPORT struct wl_event_queue *
+wl_proxy_get_queue(const struct wl_proxy *proxy)
+{
+	return proxy->queue;
+
+}
+/** Get the name of an event queue
+ *
+ * \param queue The queue to query
+ *
+ * Return the human readable name for the event queue
+ *
+ * This may be NULL if no name has been set.
+ *
+ * \memberof wl_proxy
+ */
+WL_EXPORT const char *
+wl_event_queue_get_name(const struct wl_event_queue *queue)
+{
+	return queue->name;
 }
 
 /** Create a proxy wrapper for making queue assignments thread-safe
@@ -2601,7 +2926,10 @@ wl_proxy_create_wrapper(void *proxy)
 	wrapper->flags = WL_PROXY_FLAG_WRAPPER;
 	wrapper->refcount = 1;
 
-	wl_list_insert(&wrapper->queue->proxy_list, &wrapper->queue_link);
+	if (wrapper->queue != NULL)
+		wl_list_insert(&wrapper->queue->proxy_list, &wrapper->queue_link);
+	else
+		wl_list_init(&wrapper->queue_link);
 
 	pthread_mutex_unlock(&wrapped_proxy->display->mutex);
 
@@ -2622,7 +2950,8 @@ wl_proxy_wrapper_destroy(void *proxy_wrapper)
 		wl_abort("Tried to destroy non-wrapper proxy with "
 			 "wl_proxy_wrapper_destroy\n");
 
-	assert(wrapper->refcount == 1);
+	if (!(wrapper->refcount == 1))
+		wl_abort("Expected proxy wrapper's refcount to be 1\n");
 
 	pthread_mutex_lock(&wrapper->display->mutex);
 
@@ -2633,91 +2962,44 @@ wl_proxy_wrapper_destroy(void *proxy_wrapper)
 	free(wrapper);
 }
 
-/** Safely converts an object into its corresponding proxy
- *
- * \param object object to get the proxy for
- * \return A corresponding proxy, or NULL on failure.
- *
- * Safely converts an object into its corresponding proxy.
- *
- * This is useful for implementing functions that are given a \c wl_argument
- * array, and that need to do further introspection on the ".o" field, as it
- * is otherwise an opaque type.
- *
- * \memberof wl_proxy
- */
-WL_EXPORT struct wl_proxy *
-wl_proxy_from_object(struct wl_object *object)
-{
-	struct wl_proxy *proxy;
-	if (object == NULL)
-		return NULL;
-	return wl_container_of(object, proxy, object);
-}
-
 WL_EXPORT void
 wl_log_set_handler_client(wl_log_func_t handler)
 {
 	wl_log_handler = handler;
 }
 
-/** Creates an client message observer.
- *
- * Note that the observer can potentially start receiving traffic immediately
- * after being created, and even before this call returns.
- *
- * \param display    client display to register with
- * \param func       function to call when client messages are observed
- * \param user_data  \c user_data pointer to pass to the observer
- *
- * \return The created observer, or NULL.
- *
- * \sa wl_client_observer_destroy
- *
- * \memberof wl_display
- */
+
+WL_EXPORT struct wl_proxy *
+wl_proxy_from_object(struct wl_object *object)
+{
+	struct wl_proxy *proxy;
+	if (!object)
+		return NULL;
+	return wl_container_of(object, proxy, object);
+}
 
 WL_EXPORT struct wl_client_observer *
 wl_display_create_client_observer(struct wl_display *display,
-				  wl_client_message_observer_func_t func,
-				  void *user_data)
+				 wl_client_message_observer_func_t func,
+				 void *user_data)
 {
-	struct wl_client_observer *observer;
-
-	observer = malloc(sizeof *observer);
+	struct wl_client_observer *observer = malloc(sizeof *observer);
 	if (!observer)
 		return NULL;
-
 	observer->display = display;
 	observer->func = func;
 	observer->user_data = user_data;
-
 	pthread_mutex_lock(&display->mutex);
-
 	wl_list_insert(&display->observers, &observer->link);
-
 	pthread_mutex_unlock(&display->mutex);
-
 	return observer;
 }
 
-/** Destroys a client message obsever.
- *
- * This function destroys a client message observer, and removes it from the
- * display it was added to with \c wl_display_create_client_observer.
- *
- * \param observer observer to destroy.
- *
- * \memberof wl_client_observer
- */
 WL_EXPORT void
 wl_client_observer_destroy(struct wl_client_observer *observer)
 {
 	pthread_mutex_lock(&observer->display->mutex);
-
 	wl_list_remove(&observer->link);
-
 	pthread_mutex_unlock(&observer->display->mutex);
-
 	free(observer);
 }

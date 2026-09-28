@@ -37,7 +37,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dlfcn.h>
-#include <assert.h>
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
@@ -83,13 +82,15 @@ struct wl_client {
 	pid_t pid;
 	uid_t uid;
 	gid_t gid;
-	int error;
+	bool error;
 	struct wl_priv_signal resource_created_signal;
+	void *data;
+	wl_user_data_destroy_func_t data_dtor;
 };
 
 struct wl_display {
 	struct wl_event_loop *loop;
-	int run;
+	bool run;
 
 	uint32_t next_global_name;
 	uint32_t serial;
@@ -110,17 +111,33 @@ struct wl_display {
 
 	int terminate_efd;
 	struct wl_event_source *term_source;
+
+	size_t max_buffer_size;
+};
+
+struct wl_registry {
+	struct wl_display *display;
+	struct wl_list offer_list;
 };
 
 struct wl_global {
 	struct wl_display *display;
 	const struct wl_interface *interface;
+	struct wl_list offer_list;
 	uint32_t name;
 	uint32_t version;
 	void *data;
 	wl_global_bind_func_t bind;
+	wl_global_withdrawn_func_t withdrawn;
 	struct wl_list link;
-	bool removed;
+	bool unpublished;
+};
+
+struct wl_global_offer {
+	struct wl_list global_link; /**< in struct wl_global::offer_list */
+	struct wl_list registry_link; /**< in struct wl_registry::offer_list */
+	struct wl_resource *registry_resource;
+	struct wl_global *global;
 };
 
 struct wl_resource {
@@ -146,6 +163,7 @@ struct wl_protocol_logger {
 };
 
 static int debug_server = 0;
+static int debug_color = 0;
 
 static void
 log_closure(struct wl_resource *resource,
@@ -157,7 +175,7 @@ log_closure(struct wl_resource *resource,
 	struct wl_protocol_logger_message message;
 
 	if (debug_server)
-		wl_closure_print(closure, object, send, NULL);
+		wl_closure_print(closure, object, send, false, NULL, NULL, debug_color);
 
 	if (!wl_list_empty(&display->protocol_loggers)) {
 		message.resource = resource;
@@ -189,8 +207,8 @@ verify_objects(struct wl_resource *resource, uint32_t opcode,
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
 		switch (arg.type) {
-		case 'n':
-		case 'o':
+		case WL_ARG_NEW_ID:
+		case WL_ARG_OBJECT:
 			res = (struct wl_resource *) (args[i].o);
 			if (res && res->client != resource->client) {
 				wl_log("compositor bug: The compositor "
@@ -200,6 +218,8 @@ verify_objects(struct wl_resource *resource, uint32_t opcode,
 				       object->interface->events[opcode].name);
 				return false;
 			}
+		default:
+			break;
 		}
 	}
 	return true;
@@ -217,7 +237,7 @@ handle_array(struct wl_resource *resource, uint32_t opcode,
 		return;
 
 	if (!verify_objects(resource, opcode, args)) {
-		resource->client->error = 1;
+		resource->client->error = true;
 		return;
 	}
 
@@ -225,14 +245,14 @@ handle_array(struct wl_resource *resource, uint32_t opcode,
 				     &object->interface->events[opcode]);
 
 	if (closure == NULL) {
-		resource->client->error = 1;
+		resource->client->error = true;
 		return;
 	}
 
 	log_closure(resource, closure, true);
 
 	if (send_func(closure, resource->client->connection))
-		resource->client->error = 1;
+		resource->client->error = true;
 
 	wl_closure_destroy(closure);
 }
@@ -282,7 +302,16 @@ wl_resource_queue_event(struct wl_resource *resource, uint32_t opcode, ...)
 	wl_resource_queue_event_array(resource, opcode, args);
 }
 
-static void
+/** Post a protocol error
+ *
+ * \param resource The resource object
+ * \param code The error code
+ * \param msg The error message format string
+ * \param argp The format string argument list
+ *
+ * \memberof wl_resource
+ */
+WL_EXPORT void
 wl_resource_post_error_vargs(struct wl_resource *resource,
 			     uint32_t code, const char *msg, va_list argp)
 {
@@ -303,10 +332,18 @@ wl_resource_post_error_vargs(struct wl_resource *resource,
 
 	wl_resource_post_event(client->display_resource,
 			       WL_DISPLAY_ERROR, resource, code, buffer);
-	client->error = 1;
-
+	client->error = true;
 }
 
+/** Post a protocol error
+ *
+ * \param resource The resource object
+ * \param code The error code
+ * \param msg The error message format string
+ * \param ... The format string arguments
+ *
+ * \memberof wl_resource
+ */
 WL_EXPORT void
 wl_resource_post_error(struct wl_resource *resource,
 		       uint32_t code, const char *msg, ...)
@@ -375,6 +412,29 @@ wl_client_connection_data(int fd, uint32_t mask, void *data)
 		wl_connection_copy(connection, p, sizeof p);
 		opcode = p[1] & 0xffff;
 		size = p[1] >> 16;
+
+		/*
+		 * If the message is larger than the maximum size of the
+		 * connection buffer, the connection buffer will fill to
+		 * its max size and stay there, with no message ever
+		 * successfully being processed.  Since libwayland-server
+		 * uses level-triggered epoll, it will cause the server to
+		 * enter a loop that consumes CPU.  To avoid this,
+		 * immediately disconnect the client with a protocol
+		 * error.  Since the maximum size of a message should not
+		 * depend on the buffer size chosen by the compositor,
+		 * always compare the message size against the
+		 * limit enforced by libwayland 1.22 and below (4096),
+		 * rather than the actual value the compositor chose.
+		 */
+		if (size > WL_MAX_MESSAGE_SIZE) {
+			wl_resource_post_error(client->display_resource,
+			                       WL_DISPLAY_ERROR_INVALID_METHOD,
+			                       "message length %u exceeds %d",
+			                       size, WL_MAX_MESSAGE_SIZE);
+			break;
+		}
+
 		if (len < size)
 			break;
 
@@ -391,7 +451,7 @@ wl_client_connection_data(int fd, uint32_t mask, void *data)
 		if (opcode >= object->interface->method_count) {
 			wl_resource_post_error(client->display_resource,
 					       WL_DISPLAY_ERROR_INVALID_METHOD,
-					       "invalid method %d, object %s@%u",
+					       "invalid method %d, object %s#%u",
 					       opcode,
 					       object->interface->name,
 					       object->id);
@@ -404,11 +464,11 @@ wl_client_connection_data(int fd, uint32_t mask, void *data)
 		    resource->version > 0 && resource->version < since) {
 			wl_resource_post_error(client->display_resource,
 					       WL_DISPLAY_ERROR_INVALID_METHOD,
-					       "invalid method %d (since %d < %d)"
-					       ", object %s@%u",
-					       opcode, resource->version, since,
+					       "invalid version for %s#%u.%s (%d, need at least %d)",
 					       object->interface->name,
-					       object->id);
+					       object->id,
+					       message->name,
+					       resource->version, since);
 			break;
 		}
 
@@ -423,7 +483,7 @@ wl_client_connection_data(int fd, uint32_t mask, void *data)
 			   wl_closure_lookup_objects(closure, &client->objects) < 0) {
 			wl_resource_post_error(client->display_resource,
 					       WL_DISPLAY_ERROR_INVALID_METHOD,
-					       "invalid arguments for %s@%u.%s",
+					       "invalid arguments for %s#%u.%s",
 					       object->interface->name,
 					       object->id,
 					       message->name);
@@ -514,6 +574,11 @@ bind_display(struct wl_client *client, struct wl_display *display);
  *
  * On failure this function sets errno accordingly and returns NULL.
  *
+ * On success, the new client object takes the ownership of the file
+ * descriptor. On failure, the ownership of the socket endpoint file
+ * descriptor is unchanged, it is the responsibility of the caller to
+ * perform cleanup, e.g. call close().
+ *
  * \memberof wl_display
  */
 WL_EXPORT struct wl_client *
@@ -538,7 +603,8 @@ wl_client_create(struct wl_display *display, int fd)
 				  &client->pid) != 0)
 		goto err_source;
 
-	client->connection = wl_connection_create(fd);
+	client->connection = wl_connection_create(fd, display->max_buffer_size);
+
 	if (client->connection == NULL)
 		goto err_source;
 
@@ -591,7 +657,7 @@ err_client:
  * \memberof wl_client
  */
 WL_EXPORT void
-wl_client_get_credentials(struct wl_client *client,
+wl_client_get_credentials(const struct wl_client *client,
 			  pid_t *pid, uid_t *uid, gid_t *gid)
 {
 	if (pid)
@@ -717,10 +783,23 @@ resource_is_deprecated(struct wl_resource *resource)
 	return false;
 }
 
+/** Removes the wl_resource from the client's object map and deletes it.
+ *
+ * Triggers the destroy signal and destructor for the resource before
+ * removing it from the client's object map and releasing the resource's
+ * memory.
+ *
+ * This order is important to ensure listeners and destruction code can
+ * find the resource before it has been destroyed whilst ensuring the
+ * resource is not accessible via the object map after memory has been
+ * freed.
+ */
 static enum wl_iterator_result
-destroy_resource(void *element, void *data, uint32_t flags)
+remove_and_destroy_resource(void *element, void *data, uint32_t flags)
 {
 	struct wl_resource *resource = element;
+	struct wl_client *client = resource->client;
+	uint32_t id = resource->object.id;;
 
 	wl_signal_emit(&resource->deprecated_destroy_signal, resource);
 	/* Don't emit the new signal for deprecated resources, as that would
@@ -730,6 +809,17 @@ destroy_resource(void *element, void *data, uint32_t flags)
 
 	if (resource->destroy)
 		resource->destroy(resource);
+
+	/* The resource should be cleared from the map before memory is freed. */
+	if (id < WL_SERVER_ID_START) {
+		if (client->display_resource) {
+			wl_resource_queue_event(client->display_resource,
+						WL_DISPLAY_DELETE_ID, id);
+		}
+		wl_map_insert_at(&client->objects, 0, id, NULL);
+	} else {
+		wl_map_remove(&client->objects, id);
+	}
 
 	if (!(flags & WL_MAP_ENTRY_LEGACY))
 		free(resource);
@@ -741,26 +831,13 @@ WL_EXPORT void
 wl_resource_destroy(struct wl_resource *resource)
 {
 	struct wl_client *client = resource->client;
-	uint32_t id;
-	uint32_t flags;
+	uint32_t flags = wl_map_lookup_flags(&client->objects, resource->object.id);
 
-	id = resource->object.id;
-	flags = wl_map_lookup_flags(&client->objects, id);
-	destroy_resource(resource, NULL, flags);
-
-	if (id < WL_SERVER_ID_START) {
-		if (client->display_resource) {
-			wl_resource_queue_event(client->display_resource,
-						WL_DISPLAY_DELETE_ID, id);
-		}
-		wl_map_insert_at(&client->objects, 0, id, NULL);
-	} else {
-		wl_map_remove(&client->objects, id);
-	}
+	remove_and_destroy_resource(resource, NULL, flags);
 }
 
 WL_EXPORT uint32_t
-wl_resource_get_id(struct wl_resource *resource)
+wl_resource_get_id(const struct wl_resource *resource)
 {
 	return resource->object.id;
 }
@@ -814,7 +891,7 @@ wl_resource_get_user_data(struct wl_resource *resource)
 }
 
 WL_EXPORT int
-wl_resource_get_version(struct wl_resource *resource)
+wl_resource_get_version(const struct wl_resource *resource)
 {
 	return resource->version;
 }
@@ -861,31 +938,32 @@ wl_resource_get_destroy_listener(struct wl_resource *resource,
  * \memberof wl_resource
  */
 WL_EXPORT const char *
-wl_resource_get_class(struct wl_resource *resource)
+wl_resource_get_class(const struct wl_resource *resource)
 {
 	return resource->object.interface->name;
 }
 
-/** Safely converts an object into its corresponding resource
- *
- * \param object object to get the resource for
- * \return A corresponding resource, or NULL on failure
- *
- * Safely converts an object into its corresponding resource.
- *
- * This is useful for implementing functions that are given a \c wl_argument
- * array, and that need to do further introspection on the ".o" field, as it
- * is otherwise an opaque type.
- *
- * \memberof wl_resource
- */
 WL_EXPORT struct wl_resource *
 wl_resource_from_object(struct wl_object *object)
 {
 	struct wl_resource *resource;
-	if (object == NULL)
+	if (!object)
 		return NULL;
 	return wl_container_of(object, resource, object);
+}
+
+/** Get the interface of a resource object
+ *
+ * \param resource The resource object
+ * \return The interface of the object associated with the resource
+ *
+ * \memberof wl_resource
+ * \since 1.24
+ */
+WL_EXPORT const struct wl_interface *
+wl_resource_get_interface(struct wl_resource *resource)
+{
+	return resource->object.interface;
 }
 
 /**
@@ -942,20 +1020,33 @@ wl_client_get_destroy_late_listener(struct wl_client *client,
 WL_EXPORT void
 wl_client_destroy(struct wl_client *client)
 {
-	uint32_t serial = 0;
+
+	/* wl_client_destroy() should not be called twice for the same client. */
+	if (wl_list_empty(&client->link)) {
+		client->error = 1;
+		wl_log("wl_client_destroy: encountered re-entrant client destruction.\n");
+		return;
+	}
+
+	wl_list_remove(&client->link);
+	/* Keep the client link safe to inspect. */
+	wl_list_init(&client->link);
 
 	wl_priv_signal_final_emit(&client->destroy_signal, client);
 
 	wl_client_flush(client);
-	wl_map_for_each(&client->objects, destroy_resource, &serial);
+	wl_map_for_each(&client->objects, remove_and_destroy_resource, NULL);
 	wl_map_release(&client->objects);
 	wl_event_source_remove(client->source);
 	close(wl_connection_destroy(client->connection));
 
 	wl_priv_signal_final_emit(&client->destroy_late_signal, client);
 
-	wl_list_remove(&client->link);
 	wl_list_remove(&client->resource_created_signal.listener_list);
+
+	if (client->data_dtor)
+		client->data_dtor(client->data);
+
 	free(client);
 }
 
@@ -980,36 +1071,32 @@ registry_bind(struct wl_client *client,
 	      const char *interface, uint32_t version, uint32_t id)
 {
 	struct wl_global *global;
-	struct wl_display *display = resource->data;
+	struct wl_registry *registry = resource->data;
+	struct wl_display *display = registry->display;
 
 	wl_list_for_each(global, &display->global_list, link)
 		if (global->name == name)
 			break;
 
-	if (&global->link == &display->global_list)
+	if (&global->link == &display->global_list || !wl_global_is_visible(client, global))
 		wl_resource_post_error(resource,
 				       WL_DISPLAY_ERROR_INVALID_OBJECT,
-				       "invalid global %s (%d)", interface, name);
+				       "global %s (%"PRIu32") is unavailable", interface, name);
 	else if (strcmp(global->interface->name, interface) != 0)
 		wl_resource_post_error(resource,
 				       WL_DISPLAY_ERROR_INVALID_OBJECT,
-				       "invalid interface for global %u: "
-				       "have %s, wanted %s",
-				       name, interface, global->interface->name);
+				       "invalid interface for global %"PRIu32": expected %s, got %s",
+				       name, global->interface->name, interface);
 	else if (version == 0)
 		wl_resource_post_error(resource,
 				       WL_DISPLAY_ERROR_INVALID_OBJECT,
-				       "invalid version for global %s (%d): 0 is not a valid version",
+				       "invalid version for global %s (%"PRIu32"): 0 is not a valid version",
 				       interface, name);
 	else if (global->version < version)
 		wl_resource_post_error(resource,
 				       WL_DISPLAY_ERROR_INVALID_OBJECT,
-				       "invalid version for global %s (%d): have %d, wanted %d",
+				       "invalid version for global %s (%"PRIu32"): expected at most %d, got %d",
 				       interface, name, global->version, version);
-	else if (!wl_global_is_visible(client, global))
-		wl_resource_post_error(resource,
-				       WL_DISPLAY_ERROR_INVALID_OBJECT,
-				       "invalid global %s (%d)", interface, name);
 	else
 		global->bind(client, global->data, version, id);
 }
@@ -1037,9 +1124,76 @@ display_sync(struct wl_client *client,
 }
 
 static void
-unbind_resource(struct wl_resource *resource)
+wl_global_publish(struct wl_global *global,
+		  struct wl_resource *registry_resource)
 {
+	struct wl_global_offer *offer;
+	struct wl_registry *registry = registry_resource->data;
+
+	offer = zalloc(sizeof *offer);
+	if (offer == NULL) {
+		wl_resource_post_no_memory(registry_resource);
+		return;
+	}
+
+	offer->registry_resource = registry_resource;
+	offer->global = global;
+	wl_list_insert(&global->offer_list, &offer->global_link);
+	wl_list_insert(&registry->offer_list, &offer->registry_link);
+
+	wl_resource_post_event(registry_resource,
+			       WL_REGISTRY_GLOBAL,
+			       global->name,
+			       global->interface->name,
+			       global->version);
+}
+
+static void
+wl_global_offer_destroy(struct wl_global_offer *offer)
+{
+	wl_list_remove(&offer->global_link);
+	wl_list_remove(&offer->registry_link);
+	free(offer);
+}
+
+static void
+wl_global_offer_done(struct wl_global_offer *offer)
+{
+	struct wl_global *global = offer->global;
+
+	wl_global_offer_destroy(offer);
+
+	if (global->unpublished && global->withdrawn && wl_list_empty(&global->offer_list))
+		global->withdrawn(global);
+}
+
+static struct wl_global_offer *
+wl_registry_find_offer(struct wl_registry *registry,
+		       uint32_t global_name)
+{
+	struct wl_global_offer *offer;
+
+	wl_list_for_each(offer, &registry->offer_list, registry_link) {
+		if (offer->global->name == global_name)
+			return offer;
+	}
+
+	return NULL;
+}
+
+static void
+unbind_registry_resource(struct wl_resource *resource)
+{
+	struct wl_registry *registry = resource->data;
+	struct wl_global_offer *offer;
+
+	while (!wl_list_empty(&registry->offer_list)) {
+		offer = wl_container_of(registry->offer_list.next, offer, registry_link);
+		wl_global_offer_done(offer);
+	}
+
 	wl_list_remove(&resource->link);
+	free(registry);
 }
 
 static void
@@ -1049,6 +1203,7 @@ display_get_registry(struct wl_client *client,
 	struct wl_display *display = resource->data;
 	struct wl_resource *registry_resource;
 	struct wl_global *global;
+	struct wl_registry *registry;
 
 	registry_resource =
 		wl_resource_create(client, &wl_registry_interface, 1, id);
@@ -1057,20 +1212,25 @@ display_get_registry(struct wl_client *client,
 		return;
 	}
 
+	registry = zalloc(sizeof *registry);
+	if (registry == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	registry->display = display;
+	wl_list_init(&registry->offer_list);
+
 	wl_resource_set_implementation(registry_resource,
 				       &registry_interface,
-				       display, unbind_resource);
+				       registry, unbind_registry_resource);
 
 	wl_list_insert(&display->registry_resource_list,
 		       &registry_resource->link);
 
 	wl_list_for_each(global, &display->global_list, link)
-		if (wl_global_is_visible(client, global) && !global->removed)
-			wl_resource_post_event(registry_resource,
-					       WL_REGISTRY_GLOBAL,
-					       global->name,
-					       global->interface->name,
-					       global->version);
+		if (wl_global_is_visible(client, global) && !global->unpublished)
+			wl_global_publish(global, registry_resource);
 }
 
 static const struct wl_display_interface display_interface = {
@@ -1124,10 +1284,23 @@ wl_display_create(void)
 {
 	struct wl_display *display;
 	const char *debug;
+	const char *no_color;
+	const char *force_color;
 
+	no_color = getenv("NO_COLOR");
+	force_color = getenv("FORCE_COLOR");
 	debug = getenv("WAYLAND_DEBUG");
-	if (debug && (strstr(debug, "server") || strstr(debug, "1")))
+	if (debug && (wl_check_env_token(debug, "server") || wl_check_env_token(debug, "1"))) {
 		debug_server = 1;
+		if (isatty(fileno(stderr)))
+			debug_color = 1;
+	}
+
+	if (force_color && force_color[0] != '\0')
+		debug_color = 1;
+
+	if (no_color && no_color[0] != '\0')
+		debug_color = 0;
 
 	display = zalloc(sizeof *display);
 	if (display == NULL)
@@ -1166,6 +1339,7 @@ wl_display_create(void)
 
 	display->global_filter = NULL;
 	display->global_filter_data = NULL;
+	display->max_buffer_size = WL_BUFFER_DEFAULT_MAX_SIZE;
 
 	wl_array_init(&display->additional_shm_formats);
 
@@ -1193,6 +1367,7 @@ wl_socket_destroy(struct wl_socket *s)
 	if (s->fd_lock >= 0)
 		close(s->fd_lock);
 
+	wl_list_remove(&s->link);
 	free(s);
 }
 
@@ -1207,6 +1382,7 @@ wl_socket_alloc(void)
 
 	s->fd = -1;
 	s->fd_lock = -1;
+	wl_list_init(&s->link);
 
 	return s;
 }
@@ -1322,18 +1498,28 @@ wl_global_create(struct wl_display *display,
 	global->version = version;
 	global->data = data;
 	global->bind = bind;
-	global->removed = false;
+	global->withdrawn = NULL;
+	global->unpublished = false;
 	wl_list_insert(display->global_list.prev, &global->link);
+	wl_list_init(&global->offer_list);
 
 	wl_list_for_each(resource, &display->registry_resource_list, link)
 		if (wl_global_is_visible(resource->client, global))
-			wl_resource_post_event(resource,
-					       WL_REGISTRY_GLOBAL,
-					       global->name,
-					       global->interface->name,
-					       global->version);
+			wl_global_publish(global, resource);
 
 	return global;
+}
+
+static void
+wl_global_unpublish(struct wl_global *global)
+{
+	struct wl_global_offer *offer;
+
+	wl_list_for_each(offer, &global->offer_list, global_link)
+		wl_resource_post_event(offer->registry_resource,
+				       WL_REGISTRY_GLOBAL_REMOVE, global->name);
+
+	global->unpublished = true;
 }
 
 /** Remove the global
@@ -1343,45 +1529,93 @@ wl_global_create(struct wl_display *display,
  * Broadcast a global remove event to all clients without destroying the
  * global. This function can only be called once per global.
  *
- * wl_global_destroy() removes the global and immediately destroys it. On
- * the other end, this function only removes the global, allowing clients
- * that have not yet received the global remove event to continue to bind to
- * it.
- *
  * This can be used by compositors to mitigate clients being disconnected
- * because a global has been added and removed too quickly. Compositors can call
- * wl_global_remove(), then wait an implementation-defined amount of time, then
- * call wl_global_destroy(). Note that the destruction of a global is still
- * racy, since clients have no way to acknowledge that they received the remove
- * event.
+ * because a global has been added and removed too quickly.
  *
+ * Due to the Wayland protocol being asynchronous, the wl_global objects
+ * cannot be destroyed immediately. For example, if a wl_global is destroyed
+ * and a client attempts to bind that global around same time, it can
+ * result in a protocol error due to an unknown global name in the bind request.
+ *
+ * In order to avoid crashing clients, the compositor should destroy the
+ * wl_global once it is guaranteed that no more bind requests will come.
+ *
+ * The recommended way to destroy globals is as follows:
+ *
+ * - the compositor registers a callback using the wl_global_set_withdrawn_listener()
+ *   function, which will be called when it is safe to call wl_global_destroy();
+ * - the compositor calls wl_global_remove(). This will broadcast
+ *   wl_registry.global_remove events to all clients;
+ * - upon receiving a wl_registry.global_remove event, a client must
+ *   reply to it by calling the wl_fixes.ack_global_remove() request. The
+ *   client must call the wl_fixes.ack_global_remove() request even if it
+ *   did not bind the global;
+ * - the compositor will call the wl_fixes_handle_ack_global_remove() function when
+ *   it receives the wl_fixes.ack_global_remove() request from the client;
+ * - after all clients have acknowledged the global removal, the "withdrawn"
+ *   callback will be called to notify the compositor that the
+ *   wl_global_destroy() function can be called now.
+ *
+ * \sa wl_global_set_withdrawn_listener
+ * \sa wl_fixes_handle_ack_global_remove
  * \since 1.17.90
  */
 WL_EXPORT void
 wl_global_remove(struct wl_global *global)
 {
-	struct wl_display *display = global->display;
-	struct wl_resource *resource;
-
-	if (global->removed)
+	if (global->unpublished)
 		wl_abort("wl_global_remove: called twice on the same "
-			 "global '%s@%"PRIu32"'", global->interface->name,
+			 "global '%s#%"PRIu32"'", global->interface->name,
 			 global->name);
 
-	wl_list_for_each(resource, &display->registry_resource_list, link)
-		if (wl_global_is_visible(resource->client, global))
-			wl_resource_post_event(resource, WL_REGISTRY_GLOBAL_REMOVE,
-					       global->name);
+	wl_global_unpublish(global);
 
-	global->removed = true;
+	if (global->withdrawn && wl_list_empty(&global->offer_list))
+		global->withdrawn(global);
+}
+
+/** Set the withdrawn callback.
+ *
+ * \param global The Wayland global.
+ * \param func The withdrawn callback.
+ *
+ * The withdrawn callback notifies the compositor that the global can be
+ * safely destroyed by calling wl_global_destroy(). The callback will be called
+ * in the following cases:
+ *
+ * - immediately by wl_global_remove(), if there are no registeries where the
+ *   global was announced;
+ * - or some time later after wl_global_remove(), due to either receiving the
+ *   last wl_fixes_handle_ack_global_remove() or getting the last wl_registry
+ *   where the global was announced destroyed.
+ *
+ * The withdrawn callback will never be called without prior wl_global_remove().
+ *
+ * \sa wl_fixes_handle_ack_global_remove
+ * \since 1.26
+ */
+WL_EXPORT void
+wl_global_set_withdrawn_listener(struct wl_global *global,
+				 wl_global_withdrawn_func_t func)
+{
+	global->withdrawn = func;
 }
 
 WL_EXPORT void
 wl_global_destroy(struct wl_global *global)
 {
-	if (!global->removed)
-		wl_global_remove(global);
+	struct wl_global_offer *offer;
+
+	if (!global->unpublished)
+		wl_global_unpublish(global);
+
 	wl_list_remove(&global->link);
+
+	while (!wl_list_empty(&global->offer_list)) {
+		offer = wl_container_of(global->offer_list.next, offer, global_link);
+		wl_global_offer_destroy(offer);
+	}
+
 	free(global);
 }
 
@@ -1465,7 +1699,7 @@ wl_global_set_user_data(struct wl_global *global, void *data)
  * \memberof wl_display
  */
 WL_EXPORT uint32_t
-wl_display_get_serial(struct wl_display *display)
+wl_display_get_serial(const struct wl_display *display)
 {
 	return display->serial;
 }
@@ -1499,20 +1733,23 @@ wl_display_terminate(struct wl_display *display)
 	int ret;
 	uint64_t terminate = 1;
 
-	display->run = 0;
+	display->run = false;
 
 	ret = write(display->terminate_efd, &terminate, sizeof(terminate));
-	assert (ret >= 0 || errno == EAGAIN);
+	if (ret < 0 && errno != EAGAIN)
+		wl_abort("Write failed at shutdown\n");
 }
 
 WL_EXPORT void
 wl_display_run(struct wl_display *display)
 {
-	display->run = 1;
+	display->run = true;
 
 	while (display->run) {
 		wl_display_flush_clients(display);
-		wl_event_loop_dispatch(display->loop, -1);
+		if (wl_event_loop_dispatch(display->loop, -1) < 0) {
+			break;
+		}
 	}
 }
 
@@ -1570,6 +1807,37 @@ wl_display_destroy_clients(struct wl_display *display)
 		wl_log("wl_display_destroy_clients: cannot destroy all clients because "
 			   "new ones were created by destroy callbacks\n");
 	}
+}
+
+/** Sets the default maximum size for connection buffers of new clients
+ *
+ * \param display The display object
+ * \param max_buffer_size The default maximum size of the connection buffers
+ *
+ * This function sets the default size of the internal connection buffers for
+ * new clients. It doesn't change the buffer size for existing wl_client.
+ *
+ * The connection buffer size of an existing wl_client can be adjusted using
+ * wl_client_set_max_buffer_size().
+ *
+ * The actual size of the connection buffers is a power of two, the requested
+ * \a max_buffer_size is therefore rounded up to the nearest power of two value.
+ *
+ * The minimum buffer size is 4096.
+ *
+ * \sa wl_client_set_max_buffer_size
+ *
+ * \memberof wl_display
+ * \since 1.22.90
+ */
+WL_EXPORT void
+wl_display_set_default_max_buffer_size(struct wl_display *display,
+			               size_t max_buffer_size)
+{
+	if (max_buffer_size < WL_BUFFER_DEFAULT_MAX_SIZE)
+		max_buffer_size = WL_BUFFER_DEFAULT_MAX_SIZE;
+
+	display->max_buffer_size = max_buffer_size;
 }
 
 static int
@@ -1666,7 +1934,8 @@ wl_socket_init_for_display_name(struct wl_socket *s, const char *name)
 	name_size = snprintf(s->addr.sun_path, sizeof s->addr.sun_path,
 			     "%s%s%s", runtime_dir, separator, name) + 1;
 
-	assert(name_size > 0);
+	if (!(name_size > 0))
+		wl_abort("Error assigning path name for socket address\n");
 	if (name_size > (int)sizeof s->addr.sun_path) {
 		wl_log("error: socket path \"%s%s%s\" plus null terminator"
 		       " exceeds 108 bytes\n", runtime_dir, separator, name);
@@ -1714,6 +1983,24 @@ _wl_display_add_socket(struct wl_display *display, struct wl_socket *s)
 	return 0;
 }
 
+
+/** Automatically pick a Wayland display socket for the clients to connect to.
+ *
+ * \param display Wayland display to which the socket should be added.
+ * \return The socket name if success. NULL if failed.
+ *
+ * This adds a Unix socket to Wayland display which can be used by clients to
+ * connect to Wayland display. The name of the socket is chosen automatically
+ * as the first available name in the sequence "wayland-0", "wayland-1",
+ * "wayland-2", ..., "wayland-32".
+ *
+ * The string returned by this function is owned by the library and should
+ * not be freed.
+ *
+ * \sa wl_display_add_socket
+ *
+ * \memberof wl_display
+ */
 WL_EXPORT const char *
 wl_display_add_socket_auto(struct wl_display *display)
 {
@@ -1763,6 +2050,10 @@ wl_display_add_socket_auto(struct wl_display *display)
  * The fd must be properly set to CLOEXEC and bound to a socket file
  * with both bind() and listen() already called.
  *
+ * On success, the socket fd ownership is transferred to libwayland:
+ * libwayland will close the socket when the display is destroyed or when
+ * wl_display_remove_socket_fd() is called.
+ *
  * \memberof wl_display
  */
 WL_EXPORT int
@@ -1794,6 +2085,37 @@ wl_display_add_socket_fd(struct wl_display *display, int sock_fd)
 
 	wl_list_insert(display->socket_list.prev, &s->link);
 
+	return 0;
+}
+
+/** Remove a socket fd from the Wayland display.
+ *
+ * \param display Wayland display from which the socket should be removed.
+ * \param sock_fd The socket file descriptor to be removed.
+ * \return 0 if success. -1 if failed.
+ *
+ * Remove a socket fd previously added via wl_display_add_socket_fd().
+ *
+ * \memberof wl_display
+ * \since 1.25.90
+ */
+WL_EXPORT int
+wl_display_remove_socket_fd(struct wl_display *display, int sock_fd)
+{
+	struct wl_socket *s;
+	bool found;
+
+	found = false;
+	wl_list_for_each(s, &display->socket_list, link) {
+		if (s->fd == sock_fd) {
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return -1;
+
+	wl_socket_destroy(s);
 	return 0;
 }
 
@@ -1991,7 +2313,7 @@ wl_log_set_handler_server(wl_log_func_t handler)
  * \param func The function to call to log a new protocol message
  * \param user_data The user data pointer to pass to \a func
  *
- * \return The protol logger object on success, NULL on failure.
+ * \return The protocol logger object on success, NULL on failure.
  *
  * \sa wl_protocol_logger_destroy
  *
@@ -2267,6 +2589,34 @@ wl_signal_emit_mutable(struct wl_signal *signal, void *data)
 	wl_list_remove(&end.link);
 }
 
+/** Adjust the maximum size of the client connection buffers
+ *
+ * \param client The client object
+ * \param max_buffer_size The maximum size of the connection buffers
+ *
+ * The actual size of the connection buffers is a power of two, the requested
+ * \a max_buffer_size is therefore rounded up to the nearest power of two value.
+ *
+ * Lowering the maximum size may not take effect immediately if the current content
+ * of the buffer does not fit within the new size limit.
+ *
+ * The minimum buffer size is 4096. The default buffers size can be set using
+ * wl_display_set_default_max_buffer_size().
+ *
+ * \sa wl_display_set_default_max_buffer_size()
+ *
+ * \memberof wl_client
+ * \since 1.22.90
+ */
+WL_EXPORT void
+wl_client_set_max_buffer_size(struct wl_client *client, size_t max_buffer_size)
+{
+	if (max_buffer_size < WL_BUFFER_DEFAULT_MAX_SIZE)
+		max_buffer_size = WL_BUFFER_DEFAULT_MAX_SIZE;
+
+	wl_connection_set_max_buffer_size(client->connection, max_buffer_size);
+}
+
 /** \cond INTERNAL */
 
 /** Initialize a wl_priv_signal object
@@ -2404,9 +2754,10 @@ wl_priv_signal_final_emit(struct wl_priv_signal *signal, void *data)
 
 /** \cond */ /* Deprecated functions below. */
 
+WL_DEPRECATED
 uint32_t
 wl_client_add_resource(struct wl_client *client,
-		       struct wl_resource *resource) WL_DEPRECATED;
+		       struct wl_resource *resource);
 
 WL_EXPORT uint32_t
 wl_client_add_resource(struct wl_client *client,
@@ -2435,11 +2786,12 @@ wl_client_add_resource(struct wl_client *client,
 	return resource->object.id;
 }
 
+WL_DEPRECATED
 struct wl_resource *
 wl_client_add_object(struct wl_client *client,
 		     const struct wl_interface *interface,
 		     const void *implementation,
-		     uint32_t id, void *data) WL_DEPRECATED;
+		     uint32_t id, void *data);
 
 WL_EXPORT struct wl_resource *
 wl_client_add_object(struct wl_client *client,
@@ -2458,10 +2810,11 @@ wl_client_add_object(struct wl_client *client,
 	return resource;
 }
 
+WL_DEPRECATED
 struct wl_resource *
 wl_client_new_object(struct wl_client *client,
 		     const struct wl_interface *interface,
-		     const void *implementation, void *data) WL_DEPRECATED;
+		     const void *implementation, void *data);
 
 WL_EXPORT struct wl_resource *
 wl_client_new_object(struct wl_client *client,
@@ -2480,10 +2833,51 @@ wl_client_new_object(struct wl_client *client,
 	return resource;
 }
 
+/** Set the client's user data
+ *
+ * User data is whatever the caller wants to store. Use dtor if
+ * the user data needs freeing as the very last step of destroying
+ * the client.
+ *
+ * \param client The client object
+ * \param data The user data pointer
+ * \param dtor Destroy function to be called after all resources have been
+ * destroyed and all destroy listeners have been called. Can be NULL.
+ *
+ * The argument to the destroy function is the user data pointer. If the
+ * destroy function is not NULL, it will be called even if user data is NULL.
+ *
+ * \since 1.22.90
+ * \sa wl_client_get_user_data
+ */
+WL_EXPORT void
+wl_client_set_user_data(struct wl_client *client,
+			void *data,
+			wl_user_data_destroy_func_t dtor)
+{
+	client->data = data;
+	client->data_dtor = dtor;
+}
+
+/** Get the client's user data
+ *
+ * \param client The client object
+ * \return The user data pointer
+ *
+ * \since 1.22.90
+ * \sa wl_client_set_user_data
+ */
+WL_EXPORT void *
+wl_client_get_user_data(struct wl_client *client)
+{
+	return client->data;
+}
+
+WL_DEPRECATED
 struct wl_global *
 wl_display_add_global(struct wl_display *display,
 		      const struct wl_interface *interface,
-		      void *data, wl_global_bind_func_t bind) WL_DEPRECATED;
+		      void *data, wl_global_bind_func_t bind);
 
 WL_EXPORT struct wl_global *
 wl_display_add_global(struct wl_display *display,
@@ -2493,14 +2887,56 @@ wl_display_add_global(struct wl_display *display,
 	return wl_global_create(display, interface, interface->version, data, bind);
 }
 
+WL_DEPRECATED
 void
 wl_display_remove_global(struct wl_display *display,
-			 struct wl_global *global) WL_DEPRECATED;
+			 struct wl_global *global);
 
 WL_EXPORT void
 wl_display_remove_global(struct wl_display *display, struct wl_global *global)
 {
 	wl_global_destroy(global);
+}
+
+/** Acknowledge global removal by a client
+ *
+ * \param fixes_resource The wl_fixes resource.
+ * \param registry_resource The wl_registry resource.
+ * \param global_name The unique id of the global.
+ *
+ * The compositor should call this function from the wl_fixes.ack_global_remove
+ * request implementation.
+ *
+ * libwayland-server automatically takes care of the implied ack-remove due
+ * to client disconnection or explicit wl_resource_destroy() of the wl_registry
+ * resource.
+ *
+ * \sa wl_global_remove
+ * \sa wl_global_set_withdrawn_listener
+ * \since 1.26
+ */
+WL_EXPORT void
+wl_fixes_handle_ack_global_remove(struct wl_resource *fixes_resource,
+				  struct wl_resource *registry_resource,
+				  uint32_t global_name)
+{
+	struct wl_global_offer *offer;
+	struct wl_registry *registry = registry_resource->data;
+
+	offer = wl_registry_find_offer(registry, global_name);
+	if (!offer) {
+		wl_resource_post_error(fixes_resource, WL_FIXES_ERROR_INVALID_ACK_REMOVE,
+				       "the given registry did not announce global %u", global_name);
+		return;
+	}
+
+	if (!offer->global->unpublished) {
+		wl_resource_post_error(fixes_resource, WL_FIXES_ERROR_INVALID_ACK_REMOVE,
+				       "global %u is not removed", global_name);
+		return;
+	}
+
+	wl_global_offer_done(offer);
 }
 
 /** \endcond */

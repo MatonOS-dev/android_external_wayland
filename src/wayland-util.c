@@ -121,6 +121,9 @@ wl_array_add(struct wl_array *array, size_t size)
 		alloc *= 2;
 
 	if (array->alloc < alloc) {
+		if (array->alloc == 0 && array->data != NULL)
+			wl_abort("data is non-NULL with zero alloc");
+
 		if (array->alloc > 0)
 			data = realloc(array->data, alloc);
 		else
@@ -174,9 +177,23 @@ union map_entry {
 	void *data;
 };
 
-#define map_entry_is_free(entry) ((entry).next & 0x1)
-#define map_entry_get_data(entry) ((void *)((entry).next & ~(uintptr_t)0x3))
-#define map_entry_get_flags(entry) (((entry).next >> 1) & 0x1)
+static inline bool
+map_entry_is_free(union map_entry entry)
+{
+	return entry.next & 0x1;
+}
+
+static inline void *
+map_entry_get_data(union map_entry entry)
+{
+	return (void *)(entry.next & ~(uintptr_t)0x3);
+}
+
+static inline uint32_t
+map_entry_get_flags(union map_entry entry)
+{
+	return (entry.next >> 1) & 0x1;
+}
 
 void
 wl_map_init(struct wl_map *map, uint32_t side)
@@ -407,10 +424,12 @@ for_each_helper(struct wl_array *entries, wl_iterator_func_t func, void *data)
 	union map_entry entry, *start;
 	size_t count;
 
-	start = (union map_entry *) entries->data;
-	count = entries->size / sizeof(union map_entry);
+	for (size_t idx = 0; ; idx++) {
+		count = entries->size / sizeof(union map_entry);
+		if (idx >= count)
+			break;
 
-	for (size_t idx = 0; idx < count; idx++) {
+		start = (union map_entry *) entries->data;
 		entry = start[idx];
 		if (entry.data && !map_entry_is_free(entry)) {
 			ret = func(map_entry_get_data(entry), data, map_entry_get_flags(entry));
